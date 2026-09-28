@@ -301,6 +301,51 @@ def reset_fpga(fpga_id: int, api_key: str, api_url: str) -> dict:
     return resp.json()
 
 
+class ReclockError(RuntimeError):
+    """A reclock the server refused, or one whose flash failed."""
+
+
+def reclock(fpga_id: int, api_key: str, sys_clk_freq: int, api_url: str) -> dict:
+    """Queue a reflash of a reserved board's build at another user clock (Hz).
+
+    Every build is also packed at each clock its PLL reaches without moving the
+    control plane (VCO / n); the server snaps ``sys_clk_freq`` to the nearest
+    of those within 1%. Returns the server's response, whose ``sys_clk_freq`` is
+    the exact rate that will be flashed.
+
+    Raises:
+        ReclockError: The server refused (409/422) -- its message says why,
+            e.g. listing the rates this build can reach.
+    """
+    resp = requests.post(
+        f"{api_url}/fpga/{fpga_id}/reclock",
+        headers={"X-API-Key": api_key},
+        json={"sys_clk_freq": int(sys_clk_freq)},
+    )
+    if resp.status_code in (409, 422):
+        try:
+            message = resp.json()["detail"]["message"]
+        except (ValueError, KeyError, TypeError):
+            message = resp.text
+        raise ReclockError(message)
+    resp.raise_for_status()
+    return resp.json()
+
+
+def wait_job(
+    job_id: str, api_key: str, api_url: str, timeout: float = 600.0
+) -> dict:
+    """Block until a board-side job (reset, reclock) finishes; return its record."""
+    deadline = time.monotonic() + timeout
+    while True:
+        job = get_job(job_id, api_key, api_url)
+        if job["status"] in ("complete", "failed", "cancelled"):
+            return job
+        if time.monotonic() > deadline:
+            raise TimeoutError(f"job {job_id!r} did not finish in {timeout:.0f}s")
+        time.sleep(_BUILD_POLL_INTERVAL)
+
+
 def _poll_run(job_id: str, api_key: str, api_url: str) -> list[int]:
     status_url = f"{api_url}/jobs/{job_id}"
     result_url = f"{status_url}/result"
