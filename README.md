@@ -274,3 +274,16 @@ jobs use their last-update timestamp as the end instead of continuing to tick.
 Older servers/sessions without start timestamps show `-`, as do invalid dates.
 Client clock skew can affect active durations; negative values are clamped to zero.
 JSON output retains the API response shape without adding computed duration fields.
+
+### Cloud build feedback
+
+After a cloud build, the SDK displays its configured user clock, estimated
+maximum user-clock speed, timing status, and LUT/register/BRAM/DSP usage for
+the whole FPGA design. `mrg job JOB_ID` shows the saved report too; use
+`mrg job JOB_ID --json` or `app.build_report` for structured results.
+
+A timing warning means at least one reported clock domain missed its target,
+so the design may not run reliably even though the bitstream was built and
+programmed. This first version warns without rejecting the build. Missing
+information is shown as unknown; older servers may not provide a report.
+Timing estimates are build-tool analysis, not measured hardware speeds.

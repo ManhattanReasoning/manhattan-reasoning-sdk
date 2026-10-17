@@ -401,6 +401,9 @@ def cmd_job(args: argparse.Namespace) -> None:
     print(f"  {'created at:':<14} {d['created_at']}")
     print(f"  {'updated at:':<14} {d['updated_at']}")
     print(f"  {'elapsed:':<14} {_job_elapsed(d, datetime.now(UTC))}")
+    from ._build_report import print_build_report
+
+    print_build_report(d.get("build_report"))
     print()
 
 

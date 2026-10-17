@@ -8,6 +8,7 @@ from collections.abc import Callable
 import requests
 
 from . import _client, _credentials, _progress, _transport
+from ._build_report import print_build_report
 
 # All App instances created at module import time are registered here so the
 # CLI can discover them without the user needing to export anything explicitly.
@@ -80,6 +81,7 @@ class App:
         poll_timeout: float | None = None,
         transport: str | None = None,
     ) -> None:
+        self.build_report: dict | None = None
         self.name = name
         self.design = design
         self.sources = None if sources is None else list(sources)
@@ -202,6 +204,8 @@ class App:
             raise
         self.fpga_id = job["fpga_id"]
         bar.finish(self.fpga_id)
+        self.build_report = job.get("build_report")
+        print_build_report(self.build_report)
         self._programmed = True
 
     def release(self) -> str:
