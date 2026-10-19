@@ -486,6 +486,137 @@ def _one_call(args: argparse.Namespace, api_key: str, api_url: str, call):
         transport.close()
 
 
+# ── admin: board availability ────────────────────────────────────────────────
+
+def _admin_call(call):
+    """Run an admin API call, turning the expected refusals into clean exits."""
+    try:
+        return call()
+    except requests.HTTPError as e:
+        status = e.response.status_code if e.response is not None else None
+        if status == 401:
+            sys.exit("error: not logged in -- run 'mrg login'")
+        if status == 403:
+            sys.exit("error: 'mrg admin' is for admins only")
+        if status == 404:
+            try:
+                detail = e.response.json()["detail"]["message"]
+            except (ValueError, KeyError, TypeError):
+                detail = "this server doesn't support board online/offline yet"
+            sys.exit(f"error: {detail}")
+        raise
+
+
+def _cell(plain: str, width: int, *codes: str) -> str:
+    """``plain`` padded to ``width`` columns, then colored (so ANSI codes never
+    throw off the alignment)."""
+    return _c(plain.ljust(width), *codes)
+
+
+def _tick(value: bool | None) -> tuple[str, str]:
+    if value is None:
+        return "-", _DIM
+    return ("✓", _GREEN) if value else ("✗", _RED)
+
+
+def _print_stack(boards: list[dict]) -> None:
+    """Draw the boards as they sit in the physical stack, top first."""
+    rows = []
+    for d in boards:
+        online = d.get("online", True)
+        jtag, jtag_color = _tick(d.get("jtag_present"))
+        net, net_color = _tick(d.get("network_up"))
+        rows.append(
+            " "
+            + _cell(f"FPGA {d['fpga_id']}", 8, _BOLD)
+            + _cell("● online" if online else "○ OFFLINE", 10,
+                    _GREEN if online else _RED)
+            + _cell(d["state"], 12, _STATE_COLOR.get(d["state"], ""))
+            + "jtag " + _cell(jtag, 3, jtag_color)
+            + "net " + _cell(net, 3, net_color)
+            + _cell((d.get("owner") or "")[:12], 12, _DIM)
+        )
+    inner = 1 + 8 + 10 + 12 + 5 + 3 + 4 + 3 + 12
+    print()
+    print(_c("  FPGA stack (top → bottom)", _BOLD))
+    print("  ┌" + "─" * inner + "┐")
+    for i, row in enumerate(rows):
+        print(f"  │{row}│")
+        if i < len(rows) - 1:
+            print("  ├" + "─" * inner + "┤")
+    print("  └" + "─" * inner + "┘")
+    offline = [str(d["fpga_id"]) for d in boards if not d.get("online", True)]
+    if offline:
+        print(_c(f"  offline (no new builds): {', '.join(offline)}", _DIM))
+    print()
+
+
+def _set_online_and_report(
+    fpga_id: int, online: bool, api_key: str, api_url: str
+) -> None:
+    d = _admin_call(lambda: _client.set_fpga_online(fpga_id, online, api_key, api_url))
+    if online:
+        print(f"  FPGA {fpga_id} is {_c('online', _GREEN)}: back in the build rotation")
+    else:
+        busy = d["state"] != "idle"
+        note = (
+            f" (it's {d['state']}; the current session finishes first)"
+            if busy else ""
+        )
+        print(f"  FPGA {fpga_id} is {_c('offline', _RED)}: no new builds{note}")
+
+
+def _admin_interactive(api_key: str, api_url: str) -> None:
+    """Show the stack and toggle boards until the admin quits."""
+    while True:
+        boards = _admin_call(lambda: _client.admin_list_fpgas(api_key, api_url))
+        _print_stack(boards)
+        by_id = {d["fpga_id"]: d for d in boards}
+        try:
+            choice = input(
+                "  FPGA id to toggle online/offline (Enter to refresh, q to quit): "
+            ).strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            return
+        if choice in ("q", "quit", "exit"):
+            return
+        if not choice:
+            continue
+        if not choice.isdigit() or int(choice) not in by_id:
+            print(_c(f"  no FPGA {choice!r} in the stack", _YELLOW))
+            continue
+        fpga_id = int(choice)
+        online = not by_id[fpga_id].get("online", True)
+        verb = "Bring FPGA {} online" if online else "Take FPGA {} offline"
+        try:
+            ok = input(f"  {verb.format(fpga_id)}? [y/N] ").strip().lower() == "y"
+        except (EOFError, KeyboardInterrupt):
+            print()
+            return
+        if ok:
+            _set_online_and_report(fpga_id, online, api_key, api_url)
+
+
+def cmd_admin(args: argparse.Namespace) -> None:
+    api_key, api_url = _creds(args)
+    if args.action in ("online", "offline"):
+        if not args.fpga_ids:
+            sys.exit(f"error: 'mrg admin {args.action}' needs at least one FPGA id")
+        for fpga_id in args.fpga_ids:
+            _set_online_and_report(fpga_id, args.action == "online", api_key, api_url)
+        return
+    if args.fpga_ids:
+        sys.exit("error: FPGA ids go after 'online' or 'offline'")
+    if args.json:
+        boards = _admin_call(lambda: _client.admin_list_fpgas(api_key, api_url))
+        print(json.dumps(boards, indent=2))
+    elif sys.stdin.isatty() and sys.stdout.isatty():
+        _admin_interactive(api_key, api_url)
+    else:
+        _print_stack(_admin_call(lambda: _client.admin_list_fpgas(api_key, api_url)))
+
+
 def _local_report(mode: str, args: argparse.Namespace) -> None:
     """Run a local synth/pnr build and print the JSON report on stdout."""
     from . import _local_build
@@ -693,6 +824,22 @@ def main() -> None:
     wr_p.add_argument("value", type=lambda s: int(s, 0),
                       help="32-bit value (hex or decimal)")
 
+    # admin [online|offline <fpga_id>...]
+    adm_p = sub.add_parser(
+        "admin", parents=[common],
+        help="(admins only) show the physical FPGA stack and take boards "
+             "online/offline",
+        description="Show every board as it sits in the physical stack (top "
+                    "first) and toggle it in or out of the build rotation. An "
+                    "offline board finishes any session already on it but gets "
+                    "no new builds. With no action, runs interactively.",
+    )
+    adm_p.add_argument("action", nargs="?", choices=["online", "offline"],
+                       help="bring the given boards online, or take them offline")
+    adm_p.add_argument("fpga_ids", nargs="*", type=int, metavar="FPGA_ID")
+    adm_p.add_argument("--json", action="store_true",
+                       help="print the stack as raw JSON instead")
+
     args = parser.parse_args()
 
     dispatch = {
@@ -709,6 +856,7 @@ def main() -> None:
         "write":  cmd_write,
         "synth":  cmd_synth,
         "pnr":    cmd_pnr,
+        "admin":  cmd_admin,
     }
     dispatch[args.cmd](args)
 

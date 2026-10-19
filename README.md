@@ -184,6 +184,9 @@ mrg logs | cancel <job_id>
 mrg reset <fpga_id>
 mrg read  <fpga_id> <addr> [--count N]
 mrg write <fpga_id> <addr> <value>
+mrg admin [online|offline <fpga_id>...] [--json]
+                                            # admins only: physical stack view,
+                                            # take boards in/out of rotation
 ```
 
 Human-readable `mrg status` output includes the server commit from `/health`.
