@@ -424,7 +424,9 @@ def test_text_frame_reply_raises(server, transports):
 # -- WebSocketTransport: open streams and threads ------------------------------
 
 
-def test_socket_is_not_closed_when_idle(server, transports):
+def test_socket_is_not_closed_when_idle(server, transports, monkeypatch):
+    # The old idle watcher honoured this; it must have no effect now.
+    monkeypatch.setattr(_transport, "_WS_IDLE_TIMEOUT", 0.2, raising=False)
     t = transports(server)
     t.read(0x0)
     time.sleep(0.5)

@@ -114,8 +114,8 @@ with app:                    # programs the FPGA on first use, releases on exit
 ```
 
 `read`/`write` calls go over one WebSocket that the SDK opens on the first
-call, reuses for every call after it, and closes after 25 s without a call
-(the next call reopens it). On a network that blocks WebSockets, use HTTP
+call and reuses for every call after it. It stays open for the whole session;
+the server closes it when the session ends. On a network that blocks WebSockets, use HTTP
 instead: `App(..., transport="http")`, `MRG_TRANSPORT=http`, or
 `--transport http` on `mrg run` / `mrg read` / `mrg write`. HTTP works
 anywhere but is much slower: each call is a queued job (about 0.5 s or more).
