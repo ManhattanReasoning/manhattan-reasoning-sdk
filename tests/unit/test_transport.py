@@ -129,6 +129,7 @@ class _Server:
     def __init__(self):
         self.requests: list[bytes] = []
         self.paths: list[str] = []
+        self.sockets: list = []
         self.headers: list = []
         self.replies: list = []
         self.reject_status: int | None = None
@@ -152,6 +153,7 @@ class _Server:
 
     def _handle(self, ws) -> None:
         self.paths.append(ws.request.path)
+        self.sockets.append(ws)
         # Headers is case-insensitive; keep the object itself rather than a
         # plain dict so lookups like headers["X-API-Key"] still work.
         self.headers.append(ws.request.headers)
@@ -419,54 +421,44 @@ def test_text_frame_reply_raises(server, transports):
         transports(server).read(0x0)
 
 
-# -- WebSocketTransport: idle close and threads ---------------------------------
+# -- WebSocketTransport: open streams and threads ------------------------------
 
 
-@pytest.fixture
-def short_idle(monkeypatch):
-    monkeypatch.setattr(_transport, "_WS_IDLE_TIMEOUT", 0.2)
+def test_socket_is_not_closed_when_idle(server, transports):
+    t = transports(server)
+    t.read(0x0)
+    time.sleep(0.5)
+    assert t._conn is not None  # no idle close any more
+    assert server.ended == 0
 
 
-def test_idle_socket_closes_itself_and_reopens_on_next_call(
-    server, transports, short_idle
-):
+def test_session_ended_close_is_explained(server, transports):
+    server.close_with = (4410, "Session ended: idle timeout.")
+    with pytest.raises(
+        ConnectionError, match="session on FPGA 0 has ended.*idle timeout"
+    ):
+        transports(server).read(0x0)
+
+
+def test_board_busy_close_is_explained(server, transports):
+    server.close_with = (4503, "board busy: still in use after 20s")
+    with pytest.raises(ConnectionError, match="FPGA 0 is busy"):
+        transports(server).read(0x0)
+
+
+def test_session_ended_while_idle_is_not_reconnected(server, transports):
     t = transports(server)
     t.write(0x0, [1])
-    assert _wait_until(lambda: server.ended == 1)  # closed by the idle timer
+    # The server ends the session while the socket sits idle.
+    for ws in list(server.sockets):
+        ws.close(4410, "Session ended: released.")
+    assert _wait_until(lambda: server.ended == 1)
+    with pytest.raises(
+        ConnectionError, match="session on FPGA 0 has ended.*released"
+    ):
+        t.write(0x0, [2])
+    assert len(server.paths) == 1  # did not reconnect
     assert t._conn is None
-    t.write(0x0, [2])
-    assert len(server.paths) == 2
-
-
-def test_calls_keep_pushing_the_idle_deadline_out(server, transports, short_idle):
-    t = transports(server)
-    for i in range(10):  # 0.5 s of activity, never 0.2 s idle
-        t.write(0x0, [i])
-        time.sleep(0.05)
-    assert len(server.paths) == 1
-    assert server.ended == 0
-
-
-def test_idle_timer_never_closes_during_a_slow_call(server, transports, short_idle):
-    server.delay = 0.5  # the reply takes longer than the idle timeout
-    t = transports(server)
-    assert t.read(0x8) == [0x8]
-    assert server.ended == 0
-
-
-def test_close_stops_the_idle_watcher(server, transports):
-    t = transports(server)
-    t.write(0x0, [1])
-    watcher = t._watcher
-    assert watcher.is_alive()
-    t.close()
-    assert not watcher.is_alive()
-
-
-def test_idle_watcher_does_not_keep_the_process_alive(server, transports):
-    t = transports(server)
-    t.write(0x0, [1])
-    assert t._watcher.daemon
 
 
 def test_threads_sharing_a_transport_get_their_own_replies(server, transports):
