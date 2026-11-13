@@ -23,6 +23,7 @@ _RED    = "\033[31m"
 _GREEN  = "\033[32m"
 _YELLOW = "\033[33m"
 _CYAN   = "\033[36m"
+_MAGENTA = "\033[35m"
 _DIM    = "\033[2m"
 
 _USE_COLOR = sys.stdout.isatty()
@@ -39,6 +40,7 @@ _STATE_COLOR = {
     "programming":  _YELLOW,
     "reserved":     _CYAN,
     "error":        _RED,
+    "dirty":        _MAGENTA,
 }
 
 _JOB_COLOR = {

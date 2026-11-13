@@ -4,7 +4,7 @@ Two transports share one small interface -- ``read``, ``write``, ``close``:
 
 - ``WebSocketTransport`` (the default): one WebSocket to the orchestrator's
   ``/fpga/{id}/stream`` relay, opened on the first call, reused by every call
-  after it, and closed once it has sat idle for ``_WS_IDLE_TIMEOUT`` seconds.
+  after it, and kept open until closed or until the server closes it.
 - ``HttpTransport``: every call is its own job on the orchestrator's ``/run``
   queue (``_client.read``/``_client.write``). Much slower -- the SDK polls each
   job every 0.5 s -- but plain HTTPS, for networks that block WebSockets.
@@ -18,7 +18,6 @@ from __future__ import annotations
 
 import os
 import threading
-import time
 
 import websockets.exceptions
 import websockets.sync.client
@@ -29,17 +28,6 @@ WEBSOCKET = "websocket"
 HTTP = "http"
 TRANSPORTS = (WEBSOCKET, HTTP)
 
-# Close an idle socket after this many seconds without a call. An open stream
-# holds the board's link lock on the orchestrator (state/store.py
-# fpga_link_lock, timeout=30), and the server renews that lock only when an
-# operation goes through -- keep-alive pings don't renew it. A socket left idle
-# past 30 s outlives its lock: the next op is forwarded to the FPGA unlocked,
-# then the server drops the socket. Closing it ourselves first avoids that; the
-# 5 s gap covers reply latency and the close reaching the server.
-#
-# NOTE: if fpga_link_lock's timeout changes on the server, keep this below it.
-_WS_IDLE_TIMEOUT = 25.0
-
 # How long to wait for the WebSocket handshake. A network that blocks
 # WebSockets often stalls the upgrade rather than refusing it outright.
 _WS_OPEN_TIMEOUT = 10.0
@@ -49,6 +37,14 @@ _WS_OPEN_TIMEOUT = 10.0
 # refusals before accepting -- board not reserved, not your session -- reach
 # the client as an HTTP status on the handshake instead.)
 _CLOSE_BUSY = 4409
+
+# The session ended (idle timeout, maximum length, released, or reset). Final:
+# the stream must not reconnect into a refusal.
+_CLOSE_SESSION_ENDED = 4410
+
+# The board stayed busy with another operation past the server's wait; the
+# call did not run. Trying again is fine.
+_CLOSE_BOARD_BUSY = 4503
 
 _HTTP_HINT = (
     "If your network blocks WebSockets, use HTTP instead: "
@@ -107,25 +103,21 @@ class HttpTransport:
 
 
 class WebSocketTransport:
-    """One WebSocket to the FPGA: opened on first use, closed when idle.
+    """One WebSocket to the FPGA: opened on first use and kept open until closed.
 
-    Every call holds ``self._lock`` for its whole send/receive, so the idle
-    watcher can never close the socket mid-call and two threads sharing one
-    App can't interleave frames on the wire -- the relay matches replies to
-    requests purely by order.
+    The server keeps it open for the whole session and closes it with 4410
+    when the session ends; a socket the server closed while idle is replaced
+    on the next call. Every call holds ``self._lock`` for its whole
+    send/receive, so two threads sharing one App can't interleave frames on
+    the wire -- the relay matches replies to requests purely by order.
     """
 
     def __init__(self, fpga_id: int, api_key: str, api_url: str) -> None:
         self._fpga_id = fpga_id
         self._api_key = api_key
         self._api_url = api_url
-        self._idle_timeout = _WS_IDLE_TIMEOUT
         self._lock = threading.Lock()
         self._conn: websockets.sync.client.ClientConnection | None = None
-        self._last_used = 0.0
-        # One watcher thread per open socket; _stop wakes it early on close.
-        self._stop: threading.Event | None = None
-        self._watcher: threading.Thread | None = None
 
     def read(self, addr: int, count: int = 1) -> list[int]:
         """Read ``count`` 32-bit words starting at byte address ``addr``."""
@@ -154,13 +146,9 @@ class WebSocketTransport:
             raise RuntimeError(f"{what} failed")
 
     def close(self) -> None:
-        """Close the socket and stop its idle watcher. Safe to call twice."""
+        """Close the socket. Safe to call twice."""
         with self._lock:
-            watcher = self._watcher
             self._close_locked()
-        # Join outside the lock: the watcher may be waiting to take it.
-        if watcher is not None:
-            watcher.join(timeout=1)
 
     # -- internals; every *_locked method expects self._lock to be held -------
 
@@ -182,7 +170,6 @@ class WebSocketTransport:
                 # hand the next call a stale reply. Drop it.
                 self._close_locked()
                 raise
-            self._last_used = time.monotonic()
         if isinstance(raw, str):
             raise RuntimeError("received an unexpected text frame")
         return _wire.WishboneResponse.from_bytes(raw)
@@ -195,11 +182,16 @@ class WebSocketTransport:
         conn = self._open_locked()
         try:
             conn.send(payload)
-        except websockets.exceptions.ConnectionClosed:
-            # The socket closed while idle (server restart, network drop).
-            # websockets refuses to send on a socket that isn't open, so
-            # nothing reached the server and a fresh socket can safely carry
-            # this call. Only once: a second failure is a real one.
+        except websockets.exceptions.ConnectionClosed as exc:
+            # The socket closed while idle (server restart, network drop,
+            # session ended). websockets refuses to send on a socket that
+            # isn't open, so nothing reached the server and a fresh socket
+            # can safely carry this call -- unless the session ended, which is
+            # final: say so instead of reconnecting into a refusal.
+            # Only once: a second failure is a real one.
+            if exc.rcvd is not None and exc.rcvd.code == _CLOSE_SESSION_ENDED:
+                self._close_locked()
+                raise _closed_error(exc, self._fpga_id, "this call") from exc
             self._close_locked()
             conn = self._open_locked()
             conn.send(payload)
@@ -208,46 +200,12 @@ class WebSocketTransport:
     def _open_locked(self) -> websockets.sync.client.ClientConnection:
         if self._conn is None:
             self._conn = _connect(self._fpga_id, self._api_key, self._api_url)
-            self._last_used = time.monotonic()
-            self._stop = threading.Event()
-            # Daemon: a script that ends with the socket still open must not
-            # hang waiting for the idle timeout.
-            self._watcher = threading.Thread(
-                target=self._watch_idle,
-                args=(self._conn, self._stop),
-                name=f"mrg-ws-idle-fpga{self._fpga_id}",
-                daemon=True,
-            )
-            self._watcher.start()
         return self._conn
 
     def _close_locked(self) -> None:
-        if self._stop is not None:
-            self._stop.set()
-        self._stop = None
-        self._watcher = None
         conn, self._conn = self._conn, None
         if conn is not None:
             conn.close()
-
-    def _watch_idle(
-        self, conn: websockets.sync.client.ClientConnection, stop: threading.Event
-    ) -> None:
-        """Close *conn* once no call has used it for ``_idle_timeout`` s.
-
-        Sleeps until the exact deadline rather than polling, so the close
-        lands on time; a call made meanwhile pushes the deadline out.
-        """
-        while True:
-            with self._lock:
-                if self._conn is not conn:
-                    return  # already closed or replaced
-                remaining = self._last_used + self._idle_timeout - time.monotonic()
-                if remaining <= 0:
-                    self._close_locked()
-                    return
-            if stop.wait(remaining):
-                return
 
 
 def _connect(
@@ -283,6 +241,15 @@ def _closed_error(
 ) -> ConnectionError:
     """Explain a socket that closed while a call was waiting for its reply."""
     rcvd = exc.rcvd
+    if rcvd is not None and rcvd.code == _CLOSE_SESSION_ENDED:
+        return ConnectionError(
+            f"Your session on FPGA {fpga_id} has ended ({rcvd.reason}). "
+            "Submit your design again to get a board."
+        )
+    if rcvd is not None and rcvd.code == _CLOSE_BOARD_BUSY:
+        return ConnectionError(
+            f"FPGA {fpga_id} is busy ({rcvd.reason}). Try again in a moment."
+        )
     if rcvd is not None and rcvd.code == _CLOSE_BUSY:
         # The server never forwarded this call: it closes before reading.
         return ConnectionError(

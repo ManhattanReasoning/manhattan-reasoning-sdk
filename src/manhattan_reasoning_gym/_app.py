@@ -41,7 +41,8 @@ class App:
     --fpga-id N`` / ``App(..., fpga_id=N)`` with programming skipped).
 
     ``read()``/``write()`` go over one WebSocket, opened on the first call and
-    closed after a short idle period (the next call reopens it). Pass
+    kept open for the whole session (the server closes it when the session
+    ends; the next call after that raises a clear error). Pass
     ``transport="http"`` -- or set ``$MRG_TRANSPORT=http`` -- to make each call
     its own HTTP job instead: much slower, but it works on networks that block
     WebSockets.
