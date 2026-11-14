@@ -59,3 +59,34 @@ def test_submit_combines_top_with_other_fields(monkeypatch, tmp_path):
         top="echo_slave", sys_clk_freq=90_000_000,
     )
     assert seen["data"] == {"top": "echo_slave", "sys_clk_freq": "90000000"}
+
+
+def test_submit_sends_command_and_project(monkeypatch, tmp_path):
+    design = tmp_path / "design.py"
+    design.write_text("# design\n")
+    seen = {}
+
+    def fake_post(url, headers, files, data):
+        seen["data"] = data
+        return _FakeResponse()
+
+    monkeypatch.setattr(_client.requests, "post", fake_post)
+    _client.submit(str(design), "key", "https://api.example",
+                   command="mrg run design.py", project="sat")
+    assert seen["data"] == {"command": "mrg run design.py", "project": "sat"}
+
+
+def test_submit_caps_command_and_project(monkeypatch, tmp_path):
+    design = tmp_path / "design.py"
+    design.write_text("# design\n")
+    seen = {}
+
+    def fake_post(url, headers, files, data):
+        seen["data"] = data
+        return _FakeResponse()
+
+    monkeypatch.setattr(_client.requests, "post", fake_post)
+    _client.submit(str(design), "key", "https://api.example",
+                   command="c" * 5000, project="p" * 500)
+    assert len(seen["data"]["command"]) == 1000
+    assert len(seen["data"]["project"]) == 100
