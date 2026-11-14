@@ -16,9 +16,15 @@ from . import _client, _credentials, _progress, _transport
 _registry: list[App] = []
 
 
+def _is_api_key_flag(name: str) -> bool:
+    """``--api-key`` or a shortened form of it, which argparse also accepts."""
+    return len(name) >= len("--api") and "--api-key".startswith(name)
+
+
 def _command_line(argv: list[str] | None = None) -> str:
     """How this program was started, for the dashboard: ``mrg run sat.py`` or
-    ``python sat.py --n 64``. The value of ``--api-key`` is replaced by ``***``.
+    ``python sat.py --n 64``. The value of ``--api-key`` (or a shortened form
+    such as ``--api-k``) is replaced by ``***``.
     """
     args = list(sys.argv if argv is None else argv)
     if not args or not args[0]:
@@ -34,11 +40,11 @@ def _command_line(argv: list[str] | None = None) -> str:
         if hide_next:
             rest.append("***")
             hide_next = False
-        elif arg == "--api-key":
+        elif _is_api_key_flag(arg):
             rest.append(arg)
             hide_next = True
-        elif arg.startswith("--api-key="):
-            rest.append("--api-key=***")
+        elif "=" in arg and _is_api_key_flag(arg.split("=", 1)[0]):
+            rest.append(arg.split("=", 1)[0] + "=***")
         else:
             rest.append(arg)
     return shlex.join(head + rest)[:1000]

@@ -33,3 +33,16 @@ def test_quotes_arguments_with_spaces():
 
 def test_empty_argv():
     assert _command_line([]) == "python"
+
+
+def test_command_line_redacts_shortened_api_key():
+    # argparse accepts any unambiguous start of --api-key as the key.
+    assert _command_line(["mrg", "run", "a.py", "--api-k", "s3cret"]) == (
+        "mrg run a.py --api-k '***'"
+    )
+    assert _command_line(["mrg", "run", "a.py", "--api-ke=s3cret"]) == (
+        "mrg run a.py '--api-ke=***'"
+    )
+    assert _command_line(["mrg", "run", "a.py", "--api-url", "http://x"]) == (
+        "mrg run a.py --api-url http://x"
+    )
