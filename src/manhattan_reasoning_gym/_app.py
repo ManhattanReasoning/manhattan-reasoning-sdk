@@ -205,6 +205,47 @@ class App:
         bar.finish(self.fpga_id)
         self._programmed = True
 
+    def reclock(self, sys_clk_freq: float) -> int:
+        """Switch the design to another clock without rebuilding it.
+
+        Reflashes this board with the same build re-packed at ``sys_clk_freq``
+        (Hz): identical placement and routing, only the user-clock PLL divider
+        differs, so a sweep over clocks is a true overclock test at a few
+        seconds per point. Reachable rates are VCO / n (e.g. 600 MHz / n: 50,
+        60, 75, 85.7, 100, 120, 150, ...); anything within 1% of one snaps to it.
+
+        The board, session, and network identity carry over, but reflashing
+        resets the design -- re-write any registers you had set. This App's
+        WebSocket is closed first (an open socket holds the board's link lock,
+        which the reflash needs); the next ``read()``/``write()`` reopens it.
+
+        Returns:
+            The exact clock flashed, in Hz (also stored as ``self.sys_clk_freq``).
+
+        Raises:
+            ReclockError: The server refused the rate (the message lists the
+                ones this build can reach), or the flash failed. A failed flash
+                usually means the design didn't come up at that clock; the
+                server then recovers the board and ends the session.
+        """
+        if not self._programmed or self.fpga_id is None:
+            raise _client.ReclockError("no board programmed yet; nothing to reclock")
+        self._close_connection()
+        queued = _client.reclock(
+            self.fpga_id, self.api_key, int(sys_clk_freq), self.api_url
+        )
+        job = _client.wait_job(queued["job_id"], self.api_key, self.api_url)
+        if job["status"] != "complete":
+            state = _client.get_fpga(self.fpga_id, self.api_key, self.api_url)
+            self._programmed = state.get("state") == "reserved"
+            raise _client.ReclockError(
+                f"reclock to {queued['sys_clk_freq'] / 1e6:g} MHz "
+                f"{job['status']} (FPGA {self.fpga_id} is now {state.get('state')}); "
+                f"see `mrg logs {queued['job_id']}`"
+            )
+        self.sys_clk_freq = queued["sys_clk_freq"]
+        return self.sys_clk_freq
+
     def release(self) -> str:
         """Release the active session, returning the reset job_id.
 
