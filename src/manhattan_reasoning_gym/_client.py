@@ -321,6 +321,7 @@ def reclock(fpga_id: int, api_key: str, sys_clk_freq: int, api_url: str) -> dict
         f"{api_url}/fpga/{fpga_id}/reclock",
         headers={"X-API-Key": api_key},
         json={"sys_clk_freq": int(sys_clk_freq)},
+        timeout=10.0,
     )
     if resp.status_code in (409, 422):
         try:

@@ -215,7 +215,9 @@ class App:
         60, 75, 85.7, 100, 120, 150, ...); anything within 1% of one snaps to it.
 
         The board, session, and network identity carry over, but reflashing
-        resets the design -- re-write any registers you had set.
+        resets the design -- re-write any registers you had set. This App's
+        WebSocket is closed first (an open socket holds the board's link lock,
+        which the reflash needs); the next ``read()``/``write()`` reopens it.
 
         Returns:
             The exact clock flashed, in Hz (also stored as ``self.sys_clk_freq``).
@@ -228,6 +230,7 @@ class App:
         """
         if not self._programmed or self.fpga_id is None:
             raise _client.ReclockError("no board programmed yet; nothing to reclock")
+        self._close_connection()
         queued = _client.reclock(
             self.fpga_id, self.api_key, int(sys_clk_freq), self.api_url
         )

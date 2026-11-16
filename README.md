@@ -130,6 +130,23 @@ mrg run examples/app.py
 
 Name your registers by subclassing `mrg.RegisterMap` (byte addresses).
 
+**Clock sweeps without rebuilding:** `app.reclock(hz)` reflashes the board with
+the same build at another user clock, in seconds instead of a full build. The
+placement and routing are identical at every point, so a sweep is a true
+overclock test. Reachable rates are VCO / n between 20 and 200 MHz (with the
+usual 600 MHz VCO: 50, 60, 75, 100, 120, 150, ...); a request within 1% of one
+snaps to it, and the call returns the exact rate flashed. Anything else raises
+`mrg.cloud.ReclockError` listing the rates the build can reach. Reflashing resets the
+design, so re-write any registers you had set. A rate too fast for the design
+to boot ends the session.
+
+```python
+for hz in (50e6, 75e6, 100e6, 120e6, 150e6):
+    app.reclock(hz)
+    app.write(0x0, 3)
+    print(hz, app.read(0x8))
+```
+
 **Board lifecycle:** the `with app:` form releases the board on exit, but
 `mrg run` does **not** — the reservation persists so you can keep iterating
 with `mrg run --no-program`, `mrg read`, and `mrg write`. Free the board with

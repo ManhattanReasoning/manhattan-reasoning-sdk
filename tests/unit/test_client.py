@@ -80,7 +80,7 @@ class _Resp:
 def test_reclock_posts_the_rate_and_returns_the_snapped_variant(monkeypatch):
     seen = {}
 
-    def fake_post(url, headers, json):
+    def fake_post(url, headers, json, timeout):
         seen.update(url=url, json=json)
         return _Resp(202, {"job_id": "j1", "fpga_id": 3, "sys_clk_freq": 85_714_286})
 
@@ -96,7 +96,7 @@ def test_reclock_posts_the_rate_and_returns_the_snapped_variant(monkeypatch):
 def test_reclock_surfaces_the_servers_reason(monkeypatch):
     detail = {"detail": {"error": "clock_not_available", "message": "Available: 100"}}
     monkeypatch.setattr(
-        _client.requests, "post", lambda url, headers, json: _Resp(422, detail)
+        _client.requests, "post", lambda url, headers, json, timeout: _Resp(422, detail)
     )
     try:
         _client.reclock(3, "key", 110_000_000, "https://api.example")
