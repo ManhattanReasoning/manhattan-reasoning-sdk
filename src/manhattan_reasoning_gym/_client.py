@@ -68,6 +68,8 @@ def submit(
     *,
     sources: list[str] | None = None,
     include_dir: str | None = None,
+    command: str | None = None,
+    project: str | None = None,
 ) -> str:
     """Submit a design for build_and_program and return its job id.
 
@@ -95,6 +97,11 @@ def submit(
         data["sys_clk_freq"] = str(sys_clk_freq)
     if timing_target_mhz:
         data["timing_target_mhz"] = str(timing_target_mhz)
+    # Shown on the web dashboard; older servers ignore them.
+    if command:
+        data["command"] = command[:1000]
+    if project:
+        data["project"] = project[:100]
     data = data or None
     from ._project import source_bundle
 

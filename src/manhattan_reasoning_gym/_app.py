@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import os
+import shlex
 import signal
+import sys
 import threading
 from collections.abc import Callable
 
@@ -12,6 +14,40 @@ from . import _client, _credentials, _progress, _transport
 # All App instances created at module import time are registered here so the
 # CLI can discover them without the user needing to export anything explicitly.
 _registry: list[App] = []
+
+
+def _is_api_key_flag(name: str) -> bool:
+    """``--api-key`` or a shortened form of it, which argparse also accepts."""
+    return len(name) >= len("--api") and "--api-key".startswith(name)
+
+
+def _command_line(argv: list[str] | None = None) -> str:
+    """How this program was started, for the dashboard: ``mrg run sat.py`` or
+    ``python sat.py --n 64``. The value of ``--api-key`` (or a shortened form
+    such as ``--api-k``) is replaced by ``***``.
+    """
+    args = list(sys.argv if argv is None else argv)
+    if not args or not args[0]:
+        return "python"
+    # Split on both separators: a Windows path must work when tests run on Linux.
+    prog = args[0].replace("\\", "/").rsplit("/", 1)[-1]
+    if prog.lower().endswith(".exe"):
+        prog = prog[:-4]
+    head = ["python", prog] if prog.endswith(".py") else [prog]
+    rest: list[str] = []
+    hide_next = False
+    for arg in args[1:]:
+        if hide_next:
+            rest.append("***")
+            hide_next = False
+        elif _is_api_key_flag(arg):
+            rest.append(arg)
+            hide_next = True
+        elif "=" in arg and _is_api_key_flag(arg.split("=", 1)[0]):
+            rest.append(arg.split("=", 1)[0] + "=***")
+        else:
+            rest.append(arg)
+    return shlex.join(head + rest)[:1000]
 
 
 class RegisterMap:
@@ -179,6 +215,8 @@ class App:
             top=self.top,
             sys_clk_freq=self.sys_clk_freq,
             timing_target_mhz=self.timing_target_mhz,
+            command=_command_line(),
+            project=self.name,
             **({"sources": self.sources} if self.sources is not None else {}),
             **(
                 {"include_dir": self.include_dir}
