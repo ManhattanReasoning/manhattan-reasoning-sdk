@@ -340,9 +340,10 @@ class BillingError(RuntimeError):
 
     ``code`` is the server's machine-readable reason. From ``submit`` (HTTP
     402): ``subscription_required``, ``billing_blocked``, ``quota_exhausted``
-    or ``build_in_flight``. From the billing calls: ``no_stripe_customer``
-    or ``already_subscribed`` (409), or ``billing_unavailable`` (503). The
-    message ends with the ``mrg`` command that resolves it, when there is one.
+    or ``build_in_flight``. From the billing calls (409): ``already_subscribed``,
+    ``subscription_needs_attention``, ``no_membership`` or
+    ``no_stripe_customer``; or ``billing_unavailable`` (503). The message ends
+    with the ``mrg`` command that resolves it, when there is one.
     """
 
     def __init__(self, code: str, message: str) -> None:
@@ -358,8 +359,10 @@ _BILLING_HINTS = {
     "quota_exhausted": "run 'mrg usage' to see this month's build-minutes",
     "build_in_flight": "run 'mrg jobs --status running' to see it, "
                        "'mrg cancel <job_id>' to stop it",
-    "no_stripe_customer": "run 'mrg login' again, then retry",
     "already_subscribed": "run 'mrg billing' to manage it",
+    "subscription_needs_attention": "run 'mrg billing' to update your payment "
+                                    "method",
+    "no_membership": "run 'mrg subscribe' to start one",
 }
 
 
@@ -404,18 +407,39 @@ def create_portal(api_key: str, api_url: str) -> str:
     return _billing_session_url("/billing/portal", api_key, api_url)
 
 
-def get_usage(api_key: str, api_url: str) -> dict:
+def get_usage(api_key: str, api_url: str, *, timeout: float = 30.0) -> dict:
     """Return the caller's build-minute usage for the current UTC month.
 
     Keys: ``month`` (YYYY-MM), ``build_minutes_used``, ``build_minutes_limit``,
     ``build_minutes_remaining``, and ``builds`` (recent metered builds, newest
-    first).
+    first). Newer servers add the membership: ``billing_status`` (``none``,
+    ``active``, ``blocked`` or ``comp``), ``subscription_required`` and
+    ``billing_enforced`` -- see ``membership_action``.
     """
     resp = requests.get(
-        f"{api_url}/usage", headers={"X-API-Key": api_key}, timeout=30.0
+        f"{api_url}/usage", headers={"X-API-Key": api_key}, timeout=timeout
     )
     resp.raise_for_status()
     return resp.json()
+
+
+def membership_action(usage: dict) -> str | None:
+    """Return what the caller must do before their next build, if anything.
+
+    ``"subscribe"`` when a membership is required and they have none,
+    ``"fix"`` when their membership is blocked (cancelled, or a payment is
+    failing), otherwise ``None``. Also ``None`` whenever the server isn't
+    enforcing billing -- nothing is refused then, so there is nothing to
+    prompt for -- and for older servers that don't report a membership.
+    """
+    if not usage.get("billing_enforced"):
+        return None
+    status = usage.get("billing_status")
+    if status == "blocked":
+        return "fix"
+    if status == "none" and usage.get("subscription_required"):
+        return "subscribe"
+    return None
 
 
 def wait_job(

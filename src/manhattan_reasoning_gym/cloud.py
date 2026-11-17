@@ -11,10 +11,11 @@ from __future__ import annotations
 import os
 
 from ._app import App, RegisterMap
-from ._client import ReclockError, get_session, release_session
+from ._client import BillingError, ReclockError, get_session, release_session
 
 __all__ = [
     "App",
+    "BillingError",
     "ReclockError",
     "RegisterMap",
     "get_session",

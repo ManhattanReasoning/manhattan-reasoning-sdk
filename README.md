@@ -178,7 +178,7 @@ Cloud builds count against a monthly build-minute quota, and one build can be
 in flight at a time.
 
 ```bash
-mrg usage       # build-minutes used and remaining this month (UTC)
+mrg usage       # membership status, build-minutes used and remaining this month (UTC)
 mrg subscribe   # start a membership: prints a Stripe Checkout URL and opens it
 mrg billing     # update your card, get invoices, or cancel (Stripe portal)
 ```
@@ -187,8 +187,10 @@ mrg billing     # update your card, get invoices, or cancel (Stripe portal)
 in an interactive terminal; `--no-open` never does). No card details pass
 through `mrg`. When a build is refused for a membership or quota reason,
 `mrg run` exits with the reason and the command that resolves it; from Python
-the same refusal is a `BillingError` whose `code` is `subscription_required`,
-`billing_blocked`, `quota_exhausted` or `build_in_flight`.
+the same refusal is a `mrg.cloud.BillingError` whose `code` is
+`subscription_required`, `billing_blocked`, `quota_exhausted` or
+`build_in_flight`. `mrg status` also warns ahead of time when your next build
+would be refused for a membership reason.
 
 ## Tutorials
 

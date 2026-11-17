@@ -298,6 +298,49 @@ def _print_active_builds(api_key: str, api_url: str, now: datetime) -> None:
     print()
 
 
+_MEMBERSHIP_NOTICES = {
+    "subscribe": "No membership: builds will be refused. Run 'mrg subscribe'.",
+    "fix": "Membership is not active: builds will be refused. Run 'mrg billing' "
+           "to fix your payment method, or 'mrg subscribe' if it was cancelled.",
+}
+
+
+def _print_membership_notice(api_key: str, api_url: str) -> None:
+    """Warn, before a build is refused, that the next one will be.
+
+    Silent unless the caller has to act: nothing is printed for a member in
+    good standing, during the free beta, or when the server can't be asked.
+    """
+    try:
+        usage = _client.get_usage(api_key, api_url, timeout=3)
+    except (requests.RequestException, ValueError):
+        return
+    notice = _MEMBERSHIP_NOTICES.get(_client.membership_action(usage))
+    if notice:
+        print(_c(f"  {notice}", _YELLOW))
+        print()
+
+
+def _fmt_membership(usage: dict) -> str | None:
+    """One-line membership description for ``mrg usage``; None on old servers."""
+    status = usage.get("billing_status")
+    if status is None:
+        return None
+    action = _client.membership_action(usage)
+    if status == "active":
+        return _c("active", _GREEN)
+    if status == "comp":
+        return _c("active (complimentary)", _GREEN)
+    if status == "blocked":
+        text = "not active"
+        if action:
+            text += " -- run 'mrg billing', or 'mrg subscribe' if it was cancelled"
+        return _c(text, _RED if action else _YELLOW)
+    if action == "subscribe":
+        return _c("none -- run 'mrg subscribe'", _RED)
+    return "none (not required yet)"
+
+
 def cmd_status(args: argparse.Namespace) -> None:
     api_key, api_url = _creds_optional(args)
     now = datetime.now(UTC)
@@ -357,6 +400,7 @@ def cmd_status(args: argparse.Namespace) -> None:
         print()
         if api_key:
             _print_active_builds(api_key, api_url, now)
+            _print_membership_notice(api_key, api_url)
 
 
 # ``mrg jobs --type`` values -> the job types they show.
@@ -562,7 +606,11 @@ def cmd_usage(args: argparse.Namespace) -> None:
     used, limit = d["build_minutes_used"], d["build_minutes_limit"]
     remaining = d["build_minutes_remaining"]
     color = _RED if remaining <= 0 else _YELLOW if remaining < limit * 0.1 else _GREEN
-    print(f"\n  {'month:':<12} {d['month']} (UTC)")
+    membership = _fmt_membership(d)
+    print()
+    if membership:
+        print(f"  {'membership:':<12} {membership}")
+    print(f"  {'month:':<12} {d['month']} (UTC)")
     print(f"  {'used:':<12} {used} of {limit} build-minutes")
     print(f"  {'remaining:':<12} {_c(str(remaining), color)}")
     builds = d.get("builds") or []

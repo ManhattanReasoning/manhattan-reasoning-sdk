@@ -57,8 +57,10 @@ def test_session_calls_post_and_return_url(monkeypatch, call, path):
 
 @pytest.mark.parametrize(
     ("status", "code", "hint"),
-    [(409, "no_stripe_customer", "mrg login"),
+    [(409, "no_stripe_customer", None),  # the server's message says what to do
      (409, "already_subscribed", "mrg billing"),
+     (409, "subscription_needs_attention", "mrg billing"),
+     (409, "no_membership", "mrg subscribe"),
      (503, "billing_unavailable", None)],
 )
 def test_session_refusals_become_billing_errors(monkeypatch, status, code, hint):
@@ -132,7 +134,6 @@ def test_subscribe_exits_with_the_server_reason(monkeypatch):
     with pytest.raises(SystemExit) as exc:
         _main(monkeypatch, "subscribe")
     assert "No customer yet." in str(exc.value)
-    assert "mrg login" in str(exc.value)
 
 
 _USAGE = {
@@ -163,3 +164,81 @@ def test_usage_json_is_the_raw_response(monkeypatch, capsys):
     monkeypatch.setattr(_client, "get_usage", lambda key, url: _USAGE)
     _main(monkeypatch, "usage", "--json")
     assert json.loads(capsys.readouterr().out) == _USAGE
+
+
+# ── membership status ────────────────────────────────────────────────────────
+
+def _usage(status, *, required=True, enforced=True):
+    return {**_USAGE, "billing_status": status,
+            "subscription_required": required, "billing_enforced": enforced}
+
+
+@pytest.mark.parametrize(
+    ("usage", "expected"),
+    [
+        (_usage("none"), "subscribe"),
+        (_usage("blocked"), "fix"),
+        (_usage("blocked", required=False), "fix"),  # blocked is refused either way
+        (_usage("active"), None),
+        (_usage("comp"), None),
+        (_usage("none", required=False), None),      # free beta
+        (_usage("none", enforced=False), None),      # nothing is refused
+        (_usage("blocked", enforced=False), None),
+        (_USAGE, None),                              # older server: no fields
+    ],
+)
+def test_membership_action(usage, expected):
+    assert _client.membership_action(usage) == expected
+
+
+@pytest.mark.parametrize(
+    ("usage", "text"),
+    [
+        (_usage("active"), "active"),
+        (_usage("comp"), "complimentary"),
+        (_usage("none"), "mrg subscribe"),
+        (_usage("none", required=False), "not required yet"),
+        (_usage("blocked"), "mrg billing"),
+    ],
+)
+def test_usage_shows_membership(monkeypatch, capsys, usage, text):
+    monkeypatch.setattr(_client, "get_usage", lambda key, url: usage)
+    _main(monkeypatch, "usage")
+    out = capsys.readouterr().out
+    assert "membership:" in out
+    assert text in out
+
+
+def test_usage_from_an_older_server_has_no_membership_line(monkeypatch, capsys):
+    monkeypatch.setattr(_client, "get_usage", lambda key, url: _USAGE)
+    _main(monkeypatch, "usage")
+    assert "membership" not in capsys.readouterr().out
+
+
+def _status(monkeypatch, usage):
+    monkeypatch.setattr(_client, "list_fpgas", lambda key, url: [])
+    monkeypatch.setattr(_client, "get_health", lambda url: {"git_commit": "abc"})
+    monkeypatch.setattr(_client, "list_jobs", lambda *a, **k: [])
+    if isinstance(usage, Exception):
+        def get_usage(key, url, timeout=None):
+            raise usage
+    else:
+        def get_usage(key, url, timeout=None):
+            return usage
+    monkeypatch.setattr(_client, "get_usage", get_usage)
+    _main(monkeypatch, "status")
+
+
+def test_status_warns_before_a_build_would_be_refused(monkeypatch, capsys):
+    _status(monkeypatch, _usage("none"))
+    assert "Run 'mrg subscribe'" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize(
+    "usage",
+    [_usage("active"), _usage("none", required=False), _USAGE,
+     _client.requests.ConnectionError("down")],
+)
+def test_status_is_quiet_when_there_is_nothing_to_do(monkeypatch, capsys, usage):
+    _status(monkeypatch, usage)
+    assert "membership" not in capsys.readouterr().out.lower()
