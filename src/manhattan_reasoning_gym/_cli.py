@@ -232,7 +232,10 @@ def cmd_run(args: argparse.Namespace) -> None:
         sys.exit("error: no @app.local_entrypoint() found in file")
 
     if not args.no_program:
-        app._program()
+        try:
+            app._program()
+        except _client.BillingError as e:
+            sys.exit(f"error: {e}")
 
     app._entrypoint()
 
@@ -295,6 +298,49 @@ def _print_active_builds(api_key: str, api_url: str, now: datetime) -> None:
     print()
 
 
+_MEMBERSHIP_NOTICES = {
+    "subscribe": "No membership: builds will be refused. Run 'mrg subscribe'.",
+    "fix": "Membership is not active: builds will be refused. Run 'mrg billing' "
+           "to fix your payment method, or 'mrg subscribe' if it was cancelled.",
+}
+
+
+def _print_membership_notice(api_key: str, api_url: str) -> None:
+    """Warn, before a build is refused, that the next one will be.
+
+    Silent unless the caller has to act: nothing is printed for a member in
+    good standing, during the free beta, or when the server can't be asked.
+    """
+    try:
+        usage = _client.get_usage(api_key, api_url, timeout=3)
+    except (requests.RequestException, ValueError):
+        return
+    notice = _MEMBERSHIP_NOTICES.get(_client.membership_action(usage))
+    if notice:
+        print(_c(f"  {notice}", _YELLOW))
+        print()
+
+
+def _fmt_membership(usage: dict) -> str | None:
+    """One-line membership description for ``mrg usage``; None on old servers."""
+    status = usage.get("billing_status")
+    if status is None:
+        return None
+    action = _client.membership_action(usage)
+    if status == "active":
+        return _c("active", _GREEN)
+    if status == "comp":
+        return _c("active (complimentary)", _GREEN)
+    if status == "blocked":
+        text = "not active"
+        if action:
+            text += " -- run 'mrg billing', or 'mrg subscribe' if it was cancelled"
+        return _c(text, _RED if action else _YELLOW)
+    if action == "subscribe":
+        return _c("none -- run 'mrg subscribe'", _RED)
+    return "none (not required yet)"
+
+
 def cmd_status(args: argparse.Namespace) -> None:
     api_key, api_url = _creds_optional(args)
     now = datetime.now(UTC)
@@ -354,6 +400,7 @@ def cmd_status(args: argparse.Namespace) -> None:
         print()
         if api_key:
             _print_active_builds(api_key, api_url, now)
+            _print_membership_notice(api_key, api_url)
 
 
 # ``mrg jobs --type`` values -> the job types they show.
@@ -515,6 +562,67 @@ def cmd_synth(args: argparse.Namespace) -> None:
 
 def cmd_pnr(args: argparse.Namespace) -> None:
     _local_report("pnr", args)
+
+
+def _open_billing_url(args: argparse.Namespace, url: str, what: str) -> None:
+    """Print a Stripe-hosted URL and, on an interactive terminal, open it."""
+    print(f"\n  {what}:\n  {_c(url, _BOLD)}\n")
+    if args.no_open or not sys.stdout.isatty():
+        return
+    import webbrowser
+
+    try:
+        webbrowser.open(url)
+    except Exception:
+        pass  # the URL is already printed; opening it is a convenience
+
+
+def cmd_subscribe(args: argparse.Namespace) -> None:
+    api_key, api_url = _creds(args)
+    try:
+        url = _client.create_checkout(api_key, api_url)
+    except _client.BillingError as e:
+        sys.exit(f"error: {e}")
+    _open_billing_url(args, url, "Start your membership at")
+    print("  Builds unlock once Stripe confirms the payment (usually seconds).")
+    print("  Already a member? Use 'mrg billing' instead.\n")
+
+
+def cmd_billing(args: argparse.Namespace) -> None:
+    api_key, api_url = _creds(args)
+    try:
+        url = _client.create_portal(api_key, api_url)
+    except _client.BillingError as e:
+        sys.exit(f"error: {e}")
+    _open_billing_url(args, url, "Manage your membership at")
+
+
+def cmd_usage(args: argparse.Namespace) -> None:
+    api_key, api_url = _creds(args)
+    d = _client.get_usage(api_key, api_url)
+    if args.json:
+        print(json.dumps(d, indent=2))
+        return
+    used, limit = d["build_minutes_used"], d["build_minutes_limit"]
+    remaining = d["build_minutes_remaining"]
+    color = _RED if remaining <= 0 else _YELLOW if remaining < limit * 0.1 else _GREEN
+    membership = _fmt_membership(d)
+    print()
+    if membership:
+        print(f"  {'membership:':<12} {membership}")
+    print(f"  {'month:':<12} {d['month']} (UTC)")
+    print(f"  {'used:':<12} {used} of {limit} build-minutes")
+    print(f"  {'remaining:':<12} {_c(str(remaining), color)}")
+    builds = d.get("builds") or []
+    if builds:
+        print()
+        print(_c(f"  {'JOB_ID':<10}  {'MINUTES':>7}  ENDED", _BOLD))
+        for b in builds:
+            print(
+                f"  {_fmt_id(b['job_id']):<10}  {b['build_minutes']:>7}  "
+                f"{b.get('ended_at') or '-'}"
+            )
+    print()
 
 
 # ── parser ───────────────────────────────────────────────────────────────────
@@ -695,6 +803,20 @@ def main() -> None:
     wr_p.add_argument("value", type=lambda s: int(s, 0),
                       help="32-bit value (hex or decimal)")
 
+    # subscribe / billing / usage
+    no_open = argparse.ArgumentParser(add_help=False)
+    no_open.add_argument("--no-open", action="store_true", dest="no_open",
+                         help="print the URL only; don't open a browser")
+    sub.add_parser("subscribe", parents=[common, no_open],
+                   help="start a membership (opens Stripe Checkout)")
+    sub.add_parser("billing", parents=[common, no_open],
+                   help="manage your membership: card, invoices, cancel "
+                        "(opens the Stripe customer portal)")
+    usage_p = sub.add_parser("usage", parents=[common],
+                             help="show this month's build-minutes and quota")
+    usage_p.add_argument("--json", action="store_true",
+                         help="print the raw orchestrator response as JSON")
+
     args = parser.parse_args()
 
     dispatch = {
@@ -711,6 +833,9 @@ def main() -> None:
         "write":  cmd_write,
         "synth":  cmd_synth,
         "pnr":    cmd_pnr,
+        "subscribe": cmd_subscribe,
+        "billing":   cmd_billing,
+        "usage":     cmd_usage,
     }
     dispatch[args.cmd](args)
 

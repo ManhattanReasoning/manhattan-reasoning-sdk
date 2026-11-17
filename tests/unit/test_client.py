@@ -9,6 +9,8 @@ from manhattan_reasoning_gym import _client
 
 
 class _FakeResponse:
+    status_code = 200
+
     def raise_for_status(self):
         pass
 

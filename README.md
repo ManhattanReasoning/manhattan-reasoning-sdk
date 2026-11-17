@@ -172,6 +172,26 @@ orchestrator URL). Every command resolves the key in this order:
 
 `mrg logout` revokes the key on the server and clears it locally.
 
+## Membership and usage (cloud only)
+
+Cloud builds count against a monthly build-minute quota, and one build can be
+in flight at a time.
+
+```bash
+mrg usage       # membership status, build-minutes used and remaining this month (UTC)
+mrg subscribe   # start a membership: prints a Stripe Checkout URL and opens it
+mrg billing     # update your card, get invoices, or cancel (Stripe portal)
+```
+
+`subscribe` and `billing` only print a Stripe-hosted URL (and open it when run
+in an interactive terminal; `--no-open` never does). No card details pass
+through `mrg`. When a build is refused for a membership or quota reason,
+`mrg run` exits with the reason and the command that resolves it; from Python
+the same refusal is a `mrg.cloud.BillingError` whose `code` is
+`subscription_required`, `billing_blocked`, `quota_exhausted` or
+`build_in_flight`. `mrg status` also warns ahead of time when your next build
+would be refused for a membership reason.
+
 ## Tutorials
 
 Two runnable notebooks in [`examples/notebooks/`](https://github.com/ManhattanReasoning/manhattan-reasoning-sdk/tree/main/examples/notebooks):
@@ -201,6 +221,8 @@ mrg logs | cancel <job_id>
 mrg reset <fpga_id>
 mrg read  <fpga_id> <addr> [--count N]
 mrg write <fpga_id> <addr> <value>
+mrg usage [--json]                          # this month's build-minutes and quota
+mrg subscribe | billing [--no-open]         # start / manage a membership (Stripe-hosted page)
 ```
 
 Human-readable `mrg status` output includes the server commit from `/health`.
