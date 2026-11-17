@@ -232,7 +232,10 @@ def cmd_run(args: argparse.Namespace) -> None:
         sys.exit("error: no @app.local_entrypoint() found in file")
 
     if not args.no_program:
-        app._program()
+        try:
+            app._program()
+        except _client.BillingError as e:
+            sys.exit(f"error: {e}")
 
     app._entrypoint()
 
@@ -517,6 +520,63 @@ def cmd_pnr(args: argparse.Namespace) -> None:
     _local_report("pnr", args)
 
 
+def _open_billing_url(args: argparse.Namespace, url: str, what: str) -> None:
+    """Print a Stripe-hosted URL and, on an interactive terminal, open it."""
+    print(f"\n  {what}:\n  {_c(url, _BOLD)}\n")
+    if args.no_open or not sys.stdout.isatty():
+        return
+    import webbrowser
+
+    try:
+        webbrowser.open(url)
+    except Exception:
+        pass  # the URL is already printed; opening it is a convenience
+
+
+def cmd_subscribe(args: argparse.Namespace) -> None:
+    api_key, api_url = _creds(args)
+    try:
+        url = _client.create_checkout(api_key, api_url)
+    except _client.BillingError as e:
+        sys.exit(f"error: {e}")
+    _open_billing_url(args, url, "Start your membership at")
+    print("  Builds unlock once Stripe confirms the payment (usually seconds).")
+    print("  Already a member? Use 'mrg billing' instead.\n")
+
+
+def cmd_billing(args: argparse.Namespace) -> None:
+    api_key, api_url = _creds(args)
+    try:
+        url = _client.create_portal(api_key, api_url)
+    except _client.BillingError as e:
+        sys.exit(f"error: {e}")
+    _open_billing_url(args, url, "Manage your membership at")
+
+
+def cmd_usage(args: argparse.Namespace) -> None:
+    api_key, api_url = _creds(args)
+    d = _client.get_usage(api_key, api_url)
+    if args.json:
+        print(json.dumps(d, indent=2))
+        return
+    used, limit = d["build_minutes_used"], d["build_minutes_limit"]
+    remaining = d["build_minutes_remaining"]
+    color = _RED if remaining <= 0 else _YELLOW if remaining < limit * 0.1 else _GREEN
+    print(f"\n  {'month:':<12} {d['month']} (UTC)")
+    print(f"  {'used:':<12} {used} of {limit} build-minutes")
+    print(f"  {'remaining:':<12} {_c(str(remaining), color)}")
+    builds = d.get("builds") or []
+    if builds:
+        print()
+        print(_c(f"  {'JOB_ID':<10}  {'MINUTES':>7}  ENDED", _BOLD))
+        for b in builds:
+            print(
+                f"  {_fmt_id(b['job_id']):<10}  {b['build_minutes']:>7}  "
+                f"{b.get('ended_at') or '-'}"
+            )
+    print()
+
+
 # ── parser ───────────────────────────────────────────────────────────────────
 
 def main() -> None:
@@ -695,6 +755,20 @@ def main() -> None:
     wr_p.add_argument("value", type=lambda s: int(s, 0),
                       help="32-bit value (hex or decimal)")
 
+    # subscribe / billing / usage
+    no_open = argparse.ArgumentParser(add_help=False)
+    no_open.add_argument("--no-open", action="store_true", dest="no_open",
+                         help="print the URL only; don't open a browser")
+    sub.add_parser("subscribe", parents=[common, no_open],
+                   help="start a membership (opens Stripe Checkout)")
+    sub.add_parser("billing", parents=[common, no_open],
+                   help="manage your membership: card, invoices, cancel "
+                        "(opens the Stripe customer portal)")
+    usage_p = sub.add_parser("usage", parents=[common],
+                             help="show this month's build-minutes and quota")
+    usage_p.add_argument("--json", action="store_true",
+                         help="print the raw orchestrator response as JSON")
+
     args = parser.parse_args()
 
     dispatch = {
@@ -711,6 +785,9 @@ def main() -> None:
         "write":  cmd_write,
         "synth":  cmd_synth,
         "pnr":    cmd_pnr,
+        "subscribe": cmd_subscribe,
+        "billing":   cmd_billing,
+        "usage":     cmd_usage,
     }
     dispatch[args.cmd](args)
 

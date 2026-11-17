@@ -106,6 +106,8 @@ def test_submit_sends_timing_target_form_field(monkeypatch, tmp_path):
     seen = {}
 
     class _Resp:
+        status_code = 200
+
         def raise_for_status(self):
             pass
 

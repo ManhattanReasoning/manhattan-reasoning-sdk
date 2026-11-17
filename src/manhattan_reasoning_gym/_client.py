@@ -109,6 +109,8 @@ def submit(
             resp = requests.post(
                 url, headers={"X-API-Key": api_key}, files={"file": f}, data=data
             )
+    if resp.status_code == 402:
+        raise _billing_error(resp)
     resp.raise_for_status()
     return resp.json()["job_id"]
 
@@ -329,6 +331,89 @@ def reclock(fpga_id: int, api_key: str, sys_clk_freq: int, api_url: str) -> dict
         except (ValueError, KeyError, TypeError):
             message = resp.text
         raise ReclockError(message)
+    resp.raise_for_status()
+    return resp.json()
+
+
+class BillingError(RuntimeError):
+    """A request the server refused for a membership or quota reason.
+
+    ``code`` is the server's machine-readable reason. From ``submit`` (HTTP
+    402): ``subscription_required``, ``billing_blocked``, ``quota_exhausted``
+    or ``build_in_flight``. From the billing calls: ``no_stripe_customer``
+    or ``already_subscribed`` (409), or ``billing_unavailable`` (503). The
+    message ends with the ``mrg`` command that resolves it, when there is one.
+    """
+
+    def __init__(self, code: str, message: str) -> None:
+        self.code = code
+        hint = _BILLING_HINTS.get(code)
+        super().__init__(f"{message}\n  {hint}" if hint else message)
+
+
+_BILLING_HINTS = {
+    "subscription_required": "run 'mrg subscribe' to start a membership",
+    "billing_blocked": "run 'mrg billing' to fix your payment method, or "
+                       "'mrg subscribe' if the membership was cancelled",
+    "quota_exhausted": "run 'mrg usage' to see this month's build-minutes",
+    "build_in_flight": "run 'mrg jobs --status running' to see it, "
+                       "'mrg cancel <job_id>' to stop it",
+    "no_stripe_customer": "run 'mrg login' again, then retry",
+    "already_subscribed": "run 'mrg billing' to manage it",
+}
+
+
+def _billing_error(resp) -> BillingError:
+    """Build a BillingError from an error response's ``detail`` body."""
+    try:
+        detail = resp.json()["detail"]
+        return BillingError(str(detail["error"]), str(detail["message"]))
+    except (ValueError, KeyError, TypeError):
+        return BillingError("unknown", resp.text or f"HTTP {resp.status_code}")
+
+
+def _billing_session_url(path: str, api_key: str, api_url: str) -> str:
+    resp = requests.post(
+        f"{api_url}{path}", headers={"X-API-Key": api_key}, timeout=30.0
+    )
+    if resp.status_code in (409, 503):
+        raise _billing_error(resp)
+    resp.raise_for_status()
+    return resp.json()["url"]
+
+
+def create_checkout(api_key: str, api_url: str) -> str:
+    """Return a Stripe Checkout URL where the caller can start a membership.
+
+    Nothing is charged by this call: the URL is a Stripe-hosted page to open
+    in a browser. The membership becomes active when Stripe confirms payment.
+
+    Raises:
+        BillingError: The account has no billing record yet (log in again),
+            or the billing provider is unreachable.
+    """
+    return _billing_session_url("/billing/checkout", api_key, api_url)
+
+
+def create_portal(api_key: str, api_url: str) -> str:
+    """Return a Stripe Customer Portal URL for managing the membership.
+
+    The portal is where a member updates their card, downloads invoices, or
+    cancels. Raises BillingError as ``create_checkout`` does.
+    """
+    return _billing_session_url("/billing/portal", api_key, api_url)
+
+
+def get_usage(api_key: str, api_url: str) -> dict:
+    """Return the caller's build-minute usage for the current UTC month.
+
+    Keys: ``month`` (YYYY-MM), ``build_minutes_used``, ``build_minutes_limit``,
+    ``build_minutes_remaining``, and ``builds`` (recent metered builds, newest
+    first).
+    """
+    resp = requests.get(
+        f"{api_url}/usage", headers={"X-API-Key": api_key}, timeout=30.0
+    )
     resp.raise_for_status()
     return resp.json()
 
