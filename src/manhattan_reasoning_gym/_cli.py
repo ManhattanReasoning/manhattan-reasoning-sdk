@@ -215,6 +215,8 @@ def cmd_run(args: argparse.Namespace) -> None:
         app.top = args.top
     if args.transport is not None:
         app.transport = args.transport
+    if getattr(args, "local", False):
+        app.local = True
     if args.api_url:
         app.api_url = args.api_url
     if args.api_key:
@@ -572,6 +574,10 @@ def main() -> None:
     run_p.add_argument("file", help="Python file defining an App")
     run_p.add_argument("--fpga-id", type=int, default=None, dest="fpga_id",
                        help="override the fpga_id set in the file")
+    run_p.add_argument("--local", action="store_true",
+                       help="build the bitstream on this machine (Docker, pinned "
+                            "build image) and upload it, instead of building on "
+                            "the server")
     run_p.add_argument("--no-program", action="store_true", dest="no_program",
                        help="skip programming (FPGA already has the design loaded)")
     run_p.add_argument("--sys-clk", type=lambda s: int(float(s)), default=None,

@@ -240,3 +240,33 @@ def test_bad_mrg_transport_env_exits_with_a_message(monkeypatch):
     with pytest.raises(SystemExit) as info:
         _cli.cmd_read(_rw_args())
     assert "unknown transport 'ftp'" in str(info.value)
+
+
+def test_run_local_flag_parsed(monkeypatch):
+    assert _run_main(monkeypatch, ["run", "app.py"], "cmd_run").local is False
+    assert _run_main(monkeypatch, ["run", "app.py", "--local"], "cmd_run").local
+
+
+def test_cmd_run_applies_local_flag(monkeypatch):
+    """--local switches the loaded App to the local-build path."""
+    from manhattan_reasoning_gym import _app
+
+    class _FakeApp:
+        def __init__(self):
+            self.top = None
+            self.local = False
+            self.api_url = "https://api.example"
+            self.api_key = "k"
+            self._entrypoint = lambda: None
+
+    fake_app = _FakeApp()
+    monkeypatch.setattr(
+        _cli, "_load_user_module", lambda path: _app._registry.append(fake_app)
+    )
+    args = argparse.Namespace(
+        file="app.py", fpga_id=None, sys_clk_freq=None, timing_target_mhz=None,
+        top=None, api_url=None, api_key=None, no_program=True, transport=None,
+        local=True,
+    )
+    _cli.cmd_run(args)
+    assert fake_app.local is True

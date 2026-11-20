@@ -153,6 +153,39 @@ with `mrg run --no-program`, `mrg read`, and `mrg write`. Free the board with
 `mrg reset <fpga_id>` (an async job that reflashes the base SoC, ~1 min — poll
 `mrg status`).
 
+### Build locally, run in the cloud: `mrg run --local`
+
+`mrg run --local` builds the bitstream on your machine and uses the cloud only
+to flash and run it. It is useful when the server build queue is busy or you
+want the build log on your disk.
+
+```bash
+# one-time: build the pinned build image from the Manhattan-Reasoning-Cloud repo
+docker build --platform linux/amd64 -f infra/fargate/Dockerfile -t mrg-local-build:latest .
+
+mrg run --local examples/app.py
+mrg run --local examples/app.py --sys-clk 75e6 --timing-target-mhz 80
+```
+
+What it does:
+
+1. Reserves a build slot (`POST /builds/local`) and gets back a `job_id`, the
+   slot's IP, and an upload deadline (30 min by default).
+2. Builds the design for that slot in Docker (`--network=none`). Output goes to
+   a temp folder `mrg-local-<first 8 chars of job_id>-*` holding `design.bit`, `manifest.json`
+   (sha256, image digest, git revision), and `build.log`; the path is printed.
+3. Uploads the bitstream and manifest (`PUT /jobs/{job_id}/bitstream`). The
+   server answers `queued`, flashes a board, and the job ends `complete`.
+4. Waits for the board, then runs your `@app.local_entrypoint()` as usual.
+
+In Python, use `mrg.cloud.App(..., local=True)`. Notes:
+
+- Needs Docker. Set `$MRG_LOCAL_BUILD_IMAGE` to use another image tag or digest.
+- One local build in flight per user; a second reserve gets `402 build_in_flight`.
+- Single design file only (`--include-dir` / `--source` are not supported yet).
+- If the build runs past the deadline, the upload gets `410`; run
+  `mrg run --local` again to reserve a new slot.
+
 ## Authentication (cloud only)
 
 API requests authenticate with an opaque API key sent as `X-API-Key`. You obtain
@@ -192,6 +225,7 @@ mrg pnr   <design.py> [--sys-clk-mhz N] [--timing-target-mhz N] [--target-mhz N]
                                             # local full-SoC place & route
 mrg run   <file.py> [--no-program [--fpga-id N]]   # --fpga-id only meaningful with --no-program:
                                                      # a fresh build is never pinned to a board
+mrg run   <file.py> --local                  # build on this machine (Docker), upload, then run
 mrg status [fpga_id] [--json]
 mrg jobs [--status queued|running|complete|failed|cancelled]
          [--type build|run|reset|all] [-n N | --all] [--json]
