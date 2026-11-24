@@ -4,8 +4,10 @@ import os
 import shlex
 import signal
 import sys
+import tempfile
 import threading
 from collections.abc import Callable
+from pathlib import Path
 
 import requests
 
@@ -171,8 +173,13 @@ class App:
         timing_target_mhz: float | None = None,
         poll_timeout: float | None = None,
         transport: str | None = None,
+        local: bool = False,
     ) -> None:
         self.name = name
+        # Build the bitstream on this machine instead of the build server
+        # (`mrg run --local`): reserve a slot, build in the pinned image,
+        # upload, then the server flashes it exactly like a cloud build.
+        self.local = local
         self.design = design
         self.sources = None if sources is None else list(sources)
         self.include_dir = include_dir
@@ -263,6 +270,9 @@ class App:
         is set from the completed job, not decided here -- it's discovered,
         not picked.
         """
+        if self.local:
+            self._program_local()
+            return
         job_id = _client.submit(
             self.design,
             self.api_key,
@@ -278,6 +288,65 @@ class App:
                 if self.include_dir is not None else {}
             ),
         )
+        self._wait_for_board(job_id)
+
+    def _program_local(self) -> None:
+        """Build the bitstream here, upload it, and block until it's flashed.
+
+        The server reserves a build slot first (its MAC/IP must be baked into
+        the bitstream), the build runs in the pinned image on this machine,
+        and the upload hands the job to the same flash queue a cloud build
+        uses. Any failure before the flash finishes cancels the reservation so
+        the slot goes straight back to the pool.
+        """
+        if self.sources is not None or self.include_dir is not None:
+            raise ValueError(
+                "mrg run --local builds a single design file; "
+                "sources/include_dir are not supported yet"
+            )
+        from . import _local_bitstream
+
+        res = _client.reserve_local_build(self.api_key, self.api_url)
+        job_id = res["job_id"]
+        try:
+            out_dir = Path(tempfile.mkdtemp(prefix=f"mrg-local-{job_id[:8]}-"))
+            print(
+                f"[{self.name}] reserved build slot {res['slot_id']} "
+                f"(IP {res['ip']}); building locally, upload due by "
+                f"{res['expires_at']}. Output: {out_dir}",
+                flush=True,
+            )
+            built = _local_bitstream.build_bitstream(
+                self.design,
+                slot_id=res["slot_id"],
+                out_dir=out_dir,
+                sys_clk_freq=self.sys_clk_freq,
+                timing_target_mhz=self.timing_target_mhz,
+                top=self.top,
+            )
+            try:
+                _client.upload_bitstream(
+                    job_id, built.path, built.manifest, self.api_key, self.api_url
+                )
+            except _client.LocalBuildAPIError as exc:
+                if exc.code == "reservation_expired":
+                    raise _client.LocalBuildAPIError(
+                        exc.status,
+                        exc.code,
+                        "the build finished after the reservation expired; "
+                        "run `mrg run --local` again to reserve a new slot",
+                    ) from exc
+                raise
+        except BaseException:
+            try:
+                _client.cancel_job(job_id, self.api_key, self.api_url)
+            except Exception:
+                pass
+            raise
+        self._wait_for_board(job_id)
+
+    def _wait_for_board(self, job_id: str) -> None:
+        """Block until ``job_id`` is flashed onto a board, then record which."""
         bar = _progress.BuildProgress(self.name)
         try:
             job = _client.poll_job(

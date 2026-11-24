@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import time
 
@@ -124,6 +125,59 @@ def submit(
             )
     resp.raise_for_status()
     return resp.json()["job_id"]
+
+
+class LocalBuildAPIError(RuntimeError):
+    """The server refused a local-build call; ``code`` is its error code."""
+
+    def __init__(self, status: int, code: str, message: str) -> None:
+        super().__init__(f"{message} ({status} {code})")
+        self.status = status
+        self.code = code
+
+
+def _raise_api_error(resp) -> None:
+    if resp.ok:
+        return
+    try:
+        detail = resp.json().get("detail") or {}
+    except ValueError:
+        detail = {}
+    if not isinstance(detail, dict):
+        detail = {"message": str(detail)}
+    raise LocalBuildAPIError(
+        resp.status_code,
+        detail.get("error", "http_error"),
+        detail.get("message", resp.reason or "request failed"),
+    )
+
+
+def reserve_local_build(api_key: str, api_url: str) -> dict:
+    """Reserve a build slot for a build that runs on this machine.
+
+    Returns ``job_id``, ``slot_id`` (bake it in as FPGA_ID), ``ip``, ``mac``
+    and ``expires_at`` (the upload deadline).
+    """
+    resp = requests.post(
+        f"{api_url}/builds/local", headers={"X-API-Key": api_key}
+    )
+    _raise_api_error(resp)
+    return resp.json()
+
+
+def upload_bitstream(
+    job_id: str, bitstream_path, manifest: dict, api_key: str, api_url: str
+) -> dict:
+    """Upload a locally built ``.bit`` and its manifest; the server queues a flash."""
+    with open(bitstream_path, "rb") as f:
+        resp = requests.put(
+            f"{api_url}/jobs/{job_id}/bitstream",
+            headers={"X-API-Key": api_key},
+            files={"file": (os.path.basename(str(bitstream_path)), f)},
+            data={"manifest": json.dumps(manifest)},
+        )
+    _raise_api_error(resp)
+    return resp.json()
 
 
 def poll_job(
