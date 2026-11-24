@@ -315,6 +315,20 @@ the single-file upload format. This requires the matching cloud API/build-image
 update; local `mrg synth`/`mrg pnr` remain single-file commands.
 See [the example](examples/multi_file/README.md).
 
+### What the dashboard shows about a build
+
+Each cloud build also sends the command that started it (for example
+`mrg run sat.py --top t`) and the app's name, so the web dashboard can show
+them with the build. You and the Manhattan Reasoning admins can see them.
+
+- The value of any option whose name contains `key`, `token`, `secret` or
+  `password` (as `--name value`, `--name=value` or `NAME=value`) is replaced
+  by `***`.
+- A notebook sends only `jupyter`, and `python -c` sends no code.
+
+Other values are sent as typed, so pass any other secret in an environment
+variable, not on the command line.
+
 ### Status durations
 
 `mrg status` shows `HELD FOR` (time since the current reservation began) and

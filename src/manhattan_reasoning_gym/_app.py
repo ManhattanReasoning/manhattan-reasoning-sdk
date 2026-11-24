@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import os
+import shlex
 import signal
+import sys
 import tempfile
 import threading
 from collections.abc import Callable
@@ -14,6 +16,95 @@ from . import _client, _credentials, _progress, _transport
 # All App instances created at module import time are registered here so the
 # CLI can discover them without the user needing to export anything explicitly.
 _registry: list[App] = []
+
+
+#: The longest command line sent; the server keeps at most this much.
+_MAX_COMMAND = 1000
+#: A flag or ``NAME=value`` whose name contains one of these has its value
+#: hidden: ``--api-key``, ``--token``, ``--db-password``, ``SECRET=...``.
+_SECRET_WORDS = ("key", "token", "secret", "passw")
+
+
+def _is_api_key_flag(name: str) -> bool:
+    """``--api-key`` or a shortened form of it, which argparse also accepts."""
+    return len(name) >= len("--api") and "--api-key".startswith(name)
+
+
+def _is_secret_name(name: str) -> bool:
+    lowered = name.lower()
+    return _is_api_key_flag(name) or any(w in lowered for w in _SECRET_WORDS)
+
+
+def _redact(args: list[str]) -> list[str]:
+    """``args`` with the value of every secret-looking flag replaced by ``***``."""
+    out: list[str] = []
+    hide_next = False
+    for arg in args:
+        # A word starting with "-" is the next flag, not the secret's value.
+        if hide_next and not arg.startswith("-"):
+            out.append("***")
+            hide_next = False
+            continue
+        hide_next = False
+        name, eq, _ = arg.partition("=")
+        if eq and _is_secret_name(name):
+            out.append(f"{name}=***")
+        elif arg.startswith("-") and _is_secret_name(arg):
+            out.append(arg)
+            hide_next = True
+        else:
+            out.append(arg)
+    return out
+
+
+def _join(words: list[str]) -> str:
+    """Shell-quote ``words``, dropping whole words at the end (marked ``...``)
+    rather than cutting a quoted one in half."""
+    line = ""
+    for word in words:
+        quoted = shlex.quote(word)
+        longer = f"{line} {quoted}" if line else quoted
+        if len(longer) > _MAX_COMMAND - len(" ..."):
+            return f"{line} ..." if line else quoted[:_MAX_COMMAND]
+        line = longer
+    return line
+
+
+def _main_module() -> str | None:
+    """``pkg.mod`` when this program was started as ``python -m pkg.mod``."""
+    spec = getattr(sys.modules.get("__main__"), "__spec__", None)
+    return getattr(spec, "name", None)
+
+
+def _command_line(argv: list[str] | None = None, module: str | None = None) -> str:
+    """How this program was started, for the dashboard: ``mrg run sat.py``,
+    ``python sat.py --n 64`` or ``python -m pkg.mod``.
+
+    Secret-looking values are replaced by ``***`` (``_redact``). A notebook
+    sends only ``jupyter``, because the kernel's arguments are a local file
+    path, and ``python -c`` sends no code. ``module`` is the ``-m`` module;
+    with no ``argv`` both are read from this process.
+    """
+    if argv is None:
+        argv, module = sys.argv, _main_module()
+    args = list(argv)
+    if not args or not args[0]:
+        return "python"
+    # Split on both separators: a Windows path must work when tests run on Linux.
+    prog = args[0].replace("\\", "/").rsplit("/", 1)[-1]
+    if prog.lower().endswith(".exe"):
+        prog = prog[:-4]
+    if module == "ipykernel_launcher" or prog.startswith("ipykernel_launcher"):
+        return "jupyter"
+    if prog == "-c":
+        return "python -c"
+    if module and module != "__main__":
+        head = ["python", "-m", module.removesuffix(".__main__")]
+    elif prog.endswith(".py"):
+        head = ["python", prog]
+    else:
+        head = [prog]
+    return _join(head + _redact(args[1:]))
 
 
 class RegisterMap:
@@ -189,6 +280,8 @@ class App:
             top=self.top,
             sys_clk_freq=self.sys_clk_freq,
             timing_target_mhz=self.timing_target_mhz,
+            command=_command_line(),
+            project=self.name,
             **({"sources": self.sources} if self.sources is not None else {}),
             **(
                 {"include_dir": self.include_dir}
