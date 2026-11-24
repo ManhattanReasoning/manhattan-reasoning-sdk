@@ -94,10 +94,12 @@ def _creds(args: argparse.Namespace) -> tuple[str, str]:
 def _creds_optional(args: argparse.Namespace) -> tuple[str, str]:
     """Same resolution as _creds, but never exits.
 
-    Board status, job status, and logs are public read endpoints -- the
-    orchestrator doesn't check the key for them -- so a caller with no stored
-    login shouldn't be blocked from reading them. Anything that mutates state
-    still goes through _creds, which the server does enforce.
+    Job status and logs by id are public read endpoints -- the orchestrator
+    doesn't check the key for them -- so a caller with no stored login
+    shouldn't be blocked from reading them. Board status is scoped to the
+    signed-in user: without a key the server answers 401, which
+    ``_board_request_failed`` turns into a sign-in hint. Anything that mutates
+    state goes through _creds.
     """
     api_url = args.api_url or _client.DEFAULT_API_URL
     api_key = (
@@ -297,13 +299,33 @@ def _print_active_builds(api_key: str, api_url: str, now: datetime) -> None:
     print()
 
 
+def _board_request_failed(exc: requests.HTTPError, fpga_id: int | None) -> None:
+    """Exit with a readable message for the board-status errors a user can
+    hit (not signed in; a board that isn't theirs); re-raise anything else."""
+    status = exc.response.status_code if exc.response is not None else None
+    if status == 401:
+        sys.exit(
+            "error: board status is only shown to signed-in users.\n"
+            "  run 'mrg login', set $MRG_API_KEY, or pass --api-key"
+        )
+    if status == 404 and fpga_id is not None:
+        sys.exit(
+            f"error: FPGA {fpga_id} isn't one of your boards.\n"
+            "  'mrg status' lists the boards you hold."
+        )
+    raise exc
+
+
 def cmd_status(args: argparse.Namespace) -> None:
     api_key, api_url = _creds_optional(args)
     now = datetime.now(UTC)
 
     if args.fpga_id is not None:
         # Single FPGA detail view
-        d = _client.get_fpga(args.fpga_id, api_key, api_url)
+        try:
+            d = _client.get_fpga(args.fpga_id, api_key, api_url)
+        except requests.HTTPError as exc:
+            _board_request_failed(exc, args.fpga_id)
         if args.json:
             print(json.dumps(d, indent=2))
             return
@@ -327,12 +349,20 @@ def cmd_status(args: argparse.Namespace) -> None:
             print(f"  {'job age:':<14} {job_age}")
         print()
     else:
-        # All-FPGAs table
-        fpgas = _client.list_fpgas(api_key, api_url)
+        # The caller's boards (the server shows each user only their own).
+        try:
+            fpgas = _client.list_fpgas(api_key, api_url)
+        except requests.HTTPError as exc:
+            _board_request_failed(exc, None)
         if args.json:
             print(json.dumps(fpgas, indent=2))
             return
         _print_server_version(api_url)
+        if not fpgas:
+            print("\n  You don't hold a board right now. 'mrg run' gets you one.\n")
+            if api_key:
+                _print_active_builds(api_key, api_url, now)
+            return
         header = (
             f"  {'ID':>2}  {'STATE':<14}  {'OWNER':<12}  "
             f"{'HELD FOR':<12}  {'JOB AGE':<12}  CURRENT JOB"
@@ -455,7 +485,10 @@ def cmd_cancel(args: argparse.Namespace) -> None:
 
 def cmd_reset(args: argparse.Namespace) -> None:
     api_key, api_url = _creds(args)
-    d = _client.reset_fpga(args.fpga_id, api_key, api_url)
+    try:
+        d = _client.reset_fpga(args.fpga_id, api_key, api_url)
+    except requests.HTTPError as exc:
+        _board_request_failed(exc, args.fpga_id)
     print(f"reset job queued: {d['job_id']}")
 
 
@@ -630,9 +663,9 @@ def main() -> None:
 
     # status [fpga_id]
     st_p = sub.add_parser("status", parents=[common],
-                          help="show FPGA states (all, or one if fpga_id given)")
+                          help="show your boards (all, or one if fpga_id given)")
     st_p.add_argument("fpga_id", nargs="?", type=int, default=None,
-                      help="FPGA id (omit for the full table)")
+                      help="FPGA id (omit for all of yours)")
     st_p.add_argument("--json", action="store_true",
                       help="print the raw orchestrator response as JSON")
 

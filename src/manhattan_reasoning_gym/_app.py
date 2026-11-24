@@ -398,11 +398,20 @@ class App:
         )
         job = _client.wait_job(queued["job_id"], self.api_key, self.api_url)
         if job["status"] != "complete":
-            state = _client.get_fpga(self.fpga_id, self.api_key, self.api_url)
-            self._programmed = state.get("state") == "reserved"
+            try:
+                state = _client.get_fpga(
+                    self.fpga_id, self.api_key, self.api_url
+                ).get("state")
+            except requests.HTTPError as exc:
+                # 404: the board is no longer ours (the failed flash ended
+                # the session and the reset already returned it).
+                if exc.response is None or exc.response.status_code != 404:
+                    raise
+                state = "released"
+            self._programmed = state == "reserved"
             raise _client.ReclockError(
                 f"reclock to {queued['sys_clk_freq'] / 1e6:g} MHz "
-                f"{job['status']} (FPGA {self.fpga_id} is now {state.get('state')}); "
+                f"{job['status']} (FPGA {self.fpga_id} is now {state}); "
                 f"see `mrg logs {queued['job_id']}`"
             )
         self.sys_clk_freq = queued["sys_clk_freq"]
