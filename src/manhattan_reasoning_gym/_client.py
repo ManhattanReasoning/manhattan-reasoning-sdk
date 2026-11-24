@@ -68,6 +68,8 @@ def submit(
     *,
     sources: list[str] | None = None,
     include_dir: str | None = None,
+    command: str | None = None,
+    project: str | None = None,
 ) -> str:
     """Submit a design for build_and_program and return its job id.
 
@@ -81,6 +83,12 @@ def submit(
     Amaranth, .v -> plain Verilog); ``top`` is a Verilog-only top-module
     disambiguator (ignored for Amaranth), only needed when the file has more
     than one module exposing the required Wishbone contract.
+
+    ``command`` and ``project`` are only for the web dashboard, which shows
+    them with the build: the command line that started it and the project
+    name. ``App`` sends both, with secret values in the command hidden
+    (``_app._command_line``); a build submitted without them shows neither.
+    Both are cut to the length the server keeps.
     """
     # Inspect local dependencies without importing or executing the design.
     url = f"{api_url}/submit"
@@ -95,6 +103,11 @@ def submit(
         data["sys_clk_freq"] = str(sys_clk_freq)
     if timing_target_mhz:
         data["timing_target_mhz"] = str(timing_target_mhz)
+    # Shown on the web dashboard; older servers ignore them.
+    if command:
+        data["command"] = command[:1000]
+    if project:
+        data["project"] = project[:100]
     data = data or None
     from ._project import source_bundle
 
