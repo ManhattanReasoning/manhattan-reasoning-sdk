@@ -8,7 +8,7 @@ Run with:
 ~2-3 min), then calls the ``@app.local_entrypoint()`` function. The board
 stays reserved to you after the entrypoint returns — keep iterating with
 ``mrg run examples/app.py --no-program`` / ``mrg read`` / ``mrg write``, and
-free it with ``mrg reset <fpga_id>`` (or ``app.release()``) when done.
+free it with ``mrg reset`` (or ``app.release()``) when done.
 
 Needs an API key: ``mrg login``, ``$MRG_API_KEY``, or ``--api-key``.
 """

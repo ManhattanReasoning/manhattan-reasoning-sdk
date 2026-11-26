@@ -11,28 +11,25 @@ def isolated_config(tmp_path, monkeypatch):
     return tmp_path
 
 
-# ── App board discovery ──────────────────────────────────────────────────────
+# ── App session discovery ────────────────────────────────────────────────────
 #
-# A fresh build never picks a board itself -- the server assigns whichever one
-# frees up first once the build finishes, dispatching it inline against a
-# build slot (not a board) at submit time. So there's nothing to pin or
-# auto-select before building; app.fpga_id is discovered from the completed
-# job, not chosen. fpga_id is still a meaningful App() argument for the
-# --no-program reconnect case (skip building, talk to a board you already
-# have a session on), which these tests also cover.
+# A build never picks a board: the server assigns one once the build finishes.
+# The App learns its session id from the completed job, and never a board id.
 
 
-def test_fpga_id_is_none_until_programmed(monkeypatch):
+def _complete(session_id="sess-a"):
+    return lambda *a, **kw: {"status": "complete", "session_id": session_id}
+
+
+def test_session_id_is_none_until_programmed(monkeypatch):
     monkeypatch.setattr(_client, "submit", lambda *a, **kw: "job")
-    monkeypatch.setattr(
-        _client, "poll_job", lambda *a, **kw: {"status": "complete", "fpga_id": 2}
-    )
+    monkeypatch.setattr(_client, "poll_job", _complete("sess-2"))
 
     app = manhattan_reasoning_gym.App("x", design="d.py")
-    assert app.fpga_id is None
+    assert app.session_id is None
     app._program()
 
-    assert app.fpga_id == 2
+    assert app.session_id == "sess-2"
 
 
 def test_submit_is_never_given_a_board(monkeypatch):
@@ -40,39 +37,49 @@ def test_submit_is_never_given_a_board(monkeypatch):
 
     def fake_submit(design_path, api_key, api_url, **kw):
         calls["design_path"] = design_path
+        calls.update(kw)
         return "job"
 
     monkeypatch.setattr(_client, "submit", fake_submit)
-    monkeypatch.setattr(
-        _client, "poll_job", lambda *a, **kw: {"status": "complete", "fpga_id": 4}
-    )
+    monkeypatch.setattr(_client, "poll_job", _complete())
 
     app = manhattan_reasoning_gym.App("x", design="d.py")
     app._program()
 
     assert calls["design_path"] == "d.py"
-    assert app.fpga_id == 4
+    assert not any("fpga" in k or "board" in k for k in calls)
 
 
-def test_pinned_fpga_id_is_overwritten_once_a_build_runs(monkeypatch):
-    """fpga_id passed to App() is for --no-program reconnect, not a build hint
-    -- a build that does run must still overwrite it with the real board."""
+def test_a_completed_job_without_a_session_is_a_clear_error(monkeypatch):
+    """A server too old to hand out sessions: say so rather than guess."""
     monkeypatch.setattr(_client, "submit", lambda *a, **kw: "job")
     monkeypatch.setattr(
-        _client, "poll_job", lambda *a, **kw: {"status": "complete", "fpga_id": 5}
+        _client, "poll_job", lambda *a, **kw: {"status": "complete", "fpga_id": 2}
     )
-
-    app = manhattan_reasoning_gym.App("x", design="d.py", fpga_id=3)
-    app._program()
-
-    assert app.fpga_id == 5
+    app = manhattan_reasoning_gym.App("x", design="d.py")
+    with pytest.raises(RuntimeError, match="no session id"):
+        app._program()
 
 
-def test_unprogrammed_pin_survives_with_no_program():
-    """The --no-program reconnect path never calls _program() at all, so a
-    pinned id must be left exactly as given."""
-    app = manhattan_reasoning_gym.App("x", design="d.py", fpga_id=7)
-    assert app.fpga_id == 7
+def test_builds_tell_the_server_this_client_uses_sessions(monkeypatch, tmp_path):
+    design = tmp_path / "d.py"
+    design.write_text("# design\n")
+    seen = {}
+
+    class _Resp:
+        def raise_for_status(self):
+            pass
+
+        def json(self):
+            return {"job_id": "job"}
+
+    def fake_post(url, headers, files, data):
+        seen["headers"] = headers
+        return _Resp()
+
+    monkeypatch.setattr(_client.requests, "post", fake_post)
+    _client.submit(str(design), "k", "u")
+    assert seen["headers"]["X-MRG-Client-Features"] == "sessions"
 
 
 # ── timing-target plumbing ───────────────────────────────────────────────────
@@ -85,9 +92,7 @@ def test_app_forwards_timing_target_to_submit(monkeypatch):
         return "job"
 
     monkeypatch.setattr(_client, "submit", fake_submit)
-    monkeypatch.setattr(
-        _client, "poll_job", lambda *a, **kw: {"status": "complete", "fpga_id": 1}
-    )
+    monkeypatch.setattr(_client, "poll_job", _complete())
 
     app = manhattan_reasoning_gym.App("x", design="d.py", timing_target_mhz=90)
     app._program()

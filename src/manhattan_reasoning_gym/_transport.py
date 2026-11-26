@@ -3,8 +3,8 @@
 Two transports share one small interface -- ``read``, ``write``, ``close``:
 
 - ``WebSocketTransport`` (the default): one WebSocket to the orchestrator's
-  ``/fpga/{id}/stream`` relay, opened on the first call, reused by every call
-  after it, and kept open until closed or until the server closes it.
+  ``/sessions/{session_id}/stream`` relay, opened on the first call, reused by
+  every call after it, and kept open until closed or until the server closes it.
 - ``HttpTransport``: every call is its own job on the orchestrator's ``/run``
   queue (``_client.read``/``_client.write``). Much slower -- the SDK polls each
   job every 0.5 s -- but plain HTTPS, for networks that block WebSockets.
@@ -68,33 +68,34 @@ def resolve_transport(value: str | None = None) -> str:
 
 
 def open_transport(
-    kind: str | None, fpga_id: int, api_key: str, api_url: str
+    kind: str | None, target: _client.Target, api_key: str, api_url: str
 ) -> Transport:
-    """Return a transport of *kind* (resolved via ``resolve_transport``).
+    """Return a transport of *kind* (resolved via ``resolve_transport``) to
+    ``target``: your session id (or, for an admin, a board id).
 
     Never touches the network: a WebSocket opens on its first call.
     """
     if resolve_transport(kind) == HTTP:
-        return HttpTransport(fpga_id, api_key, api_url)
-    return WebSocketTransport(fpga_id, api_key, api_url)
+        return HttpTransport(target, api_key, api_url)
+    return WebSocketTransport(target, api_key, api_url)
 
 
 class HttpTransport:
     """Each call is its own job on the orchestrator's ``/run`` queue."""
 
-    def __init__(self, fpga_id: int, api_key: str, api_url: str) -> None:
-        self._fpga_id = fpga_id
+    def __init__(self, target: _client.Target, api_key: str, api_url: str) -> None:
+        self._target = target
         self._api_key = api_key
         self._api_url = api_url
 
     def read(self, addr: int, count: int = 1) -> list[int]:
-        return _client.read(self._fpga_id, self._api_key, addr, count, self._api_url)
+        return _client.read(self._target, self._api_key, addr, count, self._api_url)
 
     def write(
         self, addr: int, words: list[int], fixed_address: bool = False
     ) -> None:
         _client.write(
-            self._fpga_id, self._api_key, addr, words, self._api_url,
+            self._target, self._api_key, addr, words, self._api_url,
             fixed_address=fixed_address,
         )
 
@@ -112,8 +113,8 @@ class WebSocketTransport:
     the wire -- the relay matches replies to requests purely by order.
     """
 
-    def __init__(self, fpga_id: int, api_key: str, api_url: str) -> None:
-        self._fpga_id = fpga_id
+    def __init__(self, target: _client.Target, api_key: str, api_url: str) -> None:
+        self._target = target
         self._api_key = api_key
         self._api_url = api_url
         self._lock = threading.Lock()
@@ -162,7 +163,7 @@ class WebSocketTransport:
                 raw = conn.recv()
             except websockets.exceptions.ConnectionClosed as exc:
                 self._close_locked()
-                raise _closed_error(exc, self._fpga_id, what) from exc
+                raise _closed_error(exc, self._target, what) from exc
             except BaseException:
                 # Interrupted mid-exchange (e.g. Ctrl-C while waiting for the
                 # reply): the server may still answer, and the relay pairs
@@ -191,7 +192,7 @@ class WebSocketTransport:
             # Only once: a second failure is a real one.
             if exc.rcvd is not None and exc.rcvd.code == _CLOSE_SESSION_ENDED:
                 self._close_locked()
-                raise _closed_error(exc, self._fpga_id, "this call") from exc
+                raise _closed_error(exc, self._target, "this call") from exc
             self._close_locked()
             conn = self._open_locked()
             conn.send(payload)
@@ -199,7 +200,7 @@ class WebSocketTransport:
 
     def _open_locked(self) -> websockets.sync.client.ClientConnection:
         if self._conn is None:
-            self._conn = _connect(self._fpga_id, self._api_key, self._api_url)
+            self._conn = _connect(self._target, self._api_key, self._api_url)
         return self._conn
 
     def _close_locked(self) -> None:
@@ -209,26 +210,30 @@ class WebSocketTransport:
 
 
 def _connect(
-    fpga_id: int, api_key: str, api_url: str
+    target: _client.Target, api_key: str, api_url: str
 ) -> websockets.sync.client.ClientConnection:
     try:
         conn = websockets.sync.client.connect(
-            _client._ws_url(api_url, fpga_id),
+            _client._ws_url(api_url, target),
             additional_headers={"X-API-Key": api_key},
             open_timeout=_WS_OPEN_TIMEOUT,
         )
     except websockets.exceptions.InvalidStatus as exc:
         status = exc.response.status_code
+        if status == 404:
+            raise ConnectionError(
+                "Couldn't reach your board: the session has ended or isn't "
+                "yours (HTTP 404). 'mrg status' lists your sessions."
+            ) from exc
         raise ConnectionError(
-            f"Couldn't open a WebSocket to FPGA {fpga_id} (HTTP {status}). "
-            f"Check the board is reserved by you: mrg status {fpga_id}. "
+            f"Couldn't open a WebSocket to your board (HTTP {status}). "
             f"{_HTTP_HINT}"
         ) from exc
     except (OSError, websockets.exceptions.InvalidHandshake) as exc:
         # OSError covers DNS failures, refused connections, and the
         # TimeoutError a stalled upgrade raises after _WS_OPEN_TIMEOUT.
         raise ConnectionError(
-            f"Couldn't open a WebSocket to FPGA {fpga_id} ({exc}). {_HTTP_HINT}"
+            f"Couldn't open a WebSocket to your board ({exc}). {_HTTP_HINT}"
         ) from exc
     # websockets >= 16 warns when a connection is used outside
     # `with connect(...)`. This one deliberately outlives any single block --
@@ -237,29 +242,29 @@ def _connect(
 
 
 def _closed_error(
-    exc: websockets.exceptions.ConnectionClosed, fpga_id: int, what: str
+    exc: websockets.exceptions.ConnectionClosed, target: _client.Target, what: str
 ) -> ConnectionError:
     """Explain a socket that closed while a call was waiting for its reply."""
     rcvd = exc.rcvd
     if rcvd is not None and rcvd.code == _CLOSE_SESSION_ENDED:
         return ConnectionError(
-            f"Your session on FPGA {fpga_id} has ended ({rcvd.reason}). "
+            f"Your session has ended ({rcvd.reason}). "
             "Submit your design again to get a board."
         )
     if rcvd is not None and rcvd.code == _CLOSE_BOARD_BUSY:
         return ConnectionError(
-            f"FPGA {fpga_id} is busy ({rcvd.reason}). Try again in a moment."
+            f"Your board is busy ({rcvd.reason}). Try again in a moment."
         )
     if rcvd is not None and rcvd.code == _CLOSE_BUSY:
         # The server never forwarded this call: it closes before reading.
         return ConnectionError(
-            f"FPGA {fpga_id} is in use by another connection "
+            "Your board is in use by another connection "
             f"(server: {rcvd.reason}). Close other scripts or terminals "
             "using this board, then try again."
         )
     detail = f" (server closed with {rcvd.code}: {rcvd.reason})" if rcvd else ""
     return ConnectionError(
-        f"Connection to FPGA {fpga_id} lost during {what}{detail}. "
+        f"Connection to your board lost during {what}{detail}. "
         "The operation may or may not have run on the FPGA."
     )
 

@@ -73,7 +73,6 @@ def test_cmd_run_applies_top_override(monkeypatch):
     class _FakeApp:
         def __init__(self):
             self.top = None
-            self.fpga_id = None
             self.sys_clk_freq = None
             self.timing_target_mhz = None
             self.api_url = "https://api.example"
@@ -91,8 +90,9 @@ def test_cmd_run_applies_top_override(monkeypatch):
     )
 
     args = argparse.Namespace(
-        file="app.py", fpga_id=None, sys_clk_freq=None, timing_target_mhz=None,
-        top="echo_slave", api_url=None, api_key=None, no_program=True, transport=None,
+        file="app.py", fpga_id=None, session=None, sys_clk_freq=None,
+        timing_target_mhz=None,
+        top="echo_slave", api_url=None, api_key=None, no_program=False, transport=None,
     )
     _cli.cmd_run(args)
     assert fake_app.top == "echo_slave"
@@ -104,8 +104,8 @@ def test_cmd_run_applies_top_override(monkeypatch):
 @pytest.mark.parametrize(
     "argv, attr",
     [
-        (["read", "3", "0x10"], "cmd_read"),
-        (["write", "3", "0x10", "0x5"], "cmd_write"),
+        (["read", "0x10"], "cmd_read"),
+        (["write", "0x10", "0x5"], "cmd_write"),
         (["run", "app.py"], "cmd_run"),
     ],
 )
@@ -116,8 +116,8 @@ def test_transport_flag_defaults_to_none(monkeypatch, argv, attr):
 @pytest.mark.parametrize(
     "argv, attr",
     [
-        (["read", "3", "0x10", "--transport", "http"], "cmd_read"),
-        (["write", "3", "0x10", "0x5", "--transport", "http"], "cmd_write"),
+        (["read", "0x10", "--transport", "http"], "cmd_read"),
+        (["write", "0x10", "0x5", "--transport", "http"], "cmd_write"),
         (["run", "app.py", "--transport", "http"], "cmd_run"),
     ],
 )
@@ -127,7 +127,7 @@ def test_transport_flag_parsed(monkeypatch, argv, attr):
 
 def test_transport_flag_rejects_unknown_values(monkeypatch):
     with pytest.raises(SystemExit):
-        _run_main(monkeypatch, ["read", "3", "0x10", "--transport", "ftp"], "cmd_read")
+        _run_main(monkeypatch, ["read", "0x10", "--transport", "ftp"], "cmd_read")
 
 
 def test_cmd_run_applies_transport_override(monkeypatch):
@@ -137,7 +137,6 @@ def test_cmd_run_applies_transport_override(monkeypatch):
     class _FakeApp:
         def __init__(self):
             self.top = None
-            self.fpga_id = None
             self.sys_clk_freq = None
             self.timing_target_mhz = None
             self.api_url = "https://api.example"
@@ -153,11 +152,15 @@ def test_cmd_run_applies_transport_override(monkeypatch):
         _cli, "_load_user_module", lambda path: _app._registry.append(fake_app)
     )
     args = argparse.Namespace(
-        file="app.py", fpga_id=None, sys_clk_freq=None, timing_target_mhz=None,
-        top=None, api_url=None, api_key=None, no_program=True, transport="http",
+        file="app.py", fpga_id=None, session=None, sys_clk_freq=None,
+        timing_target_mhz=None,
+        top=None, api_url=None, api_key=None, no_program=False, transport="http",
     )
     _cli.cmd_run(args)
     assert fake_app.transport == "http"
+
+
+SESSION = "5f0c6f1e-2b7a-4c1e-9d8f-3a2b1c0d9e8f"
 
 
 class _FakeTransport:
@@ -185,8 +188,8 @@ class _FakeTransport:
 def _patch_open_transport(monkeypatch, fake):
     opened = []
 
-    def fake_open(kind, fpga_id, api_key, api_url):
-        opened.append((kind, fpga_id, api_key, api_url))
+    def fake_open(kind, target, api_key, api_url):
+        opened.append((kind, target, api_key, api_url))
         return fake
 
     monkeypatch.setattr(_cli._transport, "open_transport", fake_open)
@@ -195,8 +198,8 @@ def _patch_open_transport(monkeypatch, fake):
 
 def _rw_args(**overrides):
     base = dict(
-        fpga_id=3, address=0x10, count=1, value=0x5, transport=None,
-        api_key="k", api_url="https://api.example",
+        session=SESSION, board=None, extra=None, address=0x10, count=1, value=0x5,
+        transport=None, api_key="k", api_url="https://api.example",
     )
     base.update(overrides)
     return argparse.Namespace(**base)
@@ -206,7 +209,7 @@ def test_cmd_read_uses_one_transport_and_closes_it(monkeypatch, capsys):
     fake = _FakeTransport(read_result=[0x2A, 0x2B])
     opened = _patch_open_transport(monkeypatch, fake)
     _cli.cmd_read(_rw_args(count=2, transport="http"))
-    assert opened == [("http", 3, "k", "https://api.example")]
+    assert opened == [("http", SESSION, "k", "https://api.example")]
     assert fake.calls == [("read", 0x10, 2)]
     assert fake.closed
     assert capsys.readouterr().out.splitlines() == [
@@ -219,19 +222,19 @@ def test_cmd_write_uses_one_transport_and_closes_it(monkeypatch):
     fake = _FakeTransport()
     opened = _patch_open_transport(monkeypatch, fake)
     _cli.cmd_write(_rw_args())
-    assert opened == [(None, 3, "k", "https://api.example")]
+    assert opened == [(None, SESSION, "k", "https://api.example")]
     assert fake.calls == [("write", 0x10, [0x5], False)]
     assert fake.closed
 
 
 @pytest.mark.parametrize("cmd", ["cmd_read", "cmd_write"])
 def test_connection_errors_exit_with_a_one_line_message(monkeypatch, cmd):
-    error = ConnectionError("FPGA 3 is in use by another connection")
+    error = ConnectionError("Your board is in use by another connection")
     fake = _FakeTransport(error=error)
     _patch_open_transport(monkeypatch, fake)
     with pytest.raises(SystemExit) as info:
         getattr(_cli, cmd)(_rw_args())
-    assert str(info.value) == "error: FPGA 3 is in use by another connection"
+    assert str(info.value) == "error: Your board is in use by another connection"
     assert fake.closed
 
 
@@ -259,14 +262,120 @@ def test_cmd_run_applies_local_flag(monkeypatch):
             self.api_key = "k"
             self._entrypoint = lambda: None
 
+        def _program(self):
+            pass
+
     fake_app = _FakeApp()
     monkeypatch.setattr(
         _cli, "_load_user_module", lambda path: _app._registry.append(fake_app)
     )
     args = argparse.Namespace(
-        file="app.py", fpga_id=None, sys_clk_freq=None, timing_target_mhz=None,
-        top=None, api_url=None, api_key=None, no_program=True, transport=None,
+        file="app.py", fpga_id=None, session=None, sys_clk_freq=None,
+        timing_target_mhz=None,
+        top=None, api_url=None, api_key=None, no_program=False, transport=None,
         local=True,
     )
     _cli.cmd_run(args)
     assert fake_app.local is True
+
+
+# -- sessions, not board numbers ---------------------------------------------
+
+
+def _sessions(monkeypatch, ids):
+    monkeypatch.setattr(
+        _cli._client, "list_sessions",
+        lambda key, url: [{"session_id": i, "state": "reserved"} for i in ids],
+    )
+
+
+def test_read_uses_your_only_session_by_default(monkeypatch):
+    _sessions(monkeypatch, [SESSION])
+    opened = _patch_open_transport(monkeypatch, _FakeTransport(read_result=[1]))
+    _cli.cmd_read(_rw_args(session=None))
+    assert opened[0][1] == SESSION
+
+
+def test_a_session_prefix_is_enough(monkeypatch):
+    _sessions(monkeypatch, [SESSION, "0" * 36])
+    opened = _patch_open_transport(monkeypatch, _FakeTransport(read_result=[1]))
+    _cli.cmd_read(_rw_args(session=SESSION[:8]))
+    assert opened[0][1] == SESSION
+
+
+def test_several_sessions_need_a_choice(monkeypatch):
+    _sessions(monkeypatch, [SESSION, "0" * 36])
+    with pytest.raises(SystemExit) as info:
+        _cli.cmd_read(_rw_args(session=None))
+    assert "--session" in str(info.value)
+
+
+def test_no_session_says_how_to_get_a_board(monkeypatch):
+    _sessions(monkeypatch, [])
+    with pytest.raises(SystemExit) as info:
+        _cli.cmd_write(_rw_args(session=None))
+    assert "mrg run" in str(info.value)
+
+
+@pytest.mark.parametrize(
+    "argv, attr",
+    [(["read", "3", "0x10"], "cmd_read"), (["write", "3", "0x10", "0x5"], "cmd_write")],
+)
+def test_the_old_board_number_forms_explain_the_change(monkeypatch, argv, attr):
+    real = getattr(_cli, attr)
+    args = _run_main(monkeypatch, argv, attr)
+    with pytest.raises(SystemExit) as info:
+        real(args)
+    assert "aren't addressed by number" in str(info.value)
+
+
+def test_a_board_number_given_as_a_session_explains_the_change(monkeypatch):
+    with pytest.raises(SystemExit) as info:
+        _cli.cmd_read(_rw_args(session="3"))
+    assert "board number" in str(info.value)
+
+
+def test_run_fpga_id_flag_explains_the_change(monkeypatch):
+    from manhattan_reasoning_gym import _app
+
+    class _FakeApp:
+        api_url, api_key = "https://api.example", "k"
+
+    monkeypatch.setattr(
+        _cli, "_load_user_module", lambda path: _app._registry.append(_FakeApp())
+    )
+    real = _cli.cmd_run
+    args = _run_main(monkeypatch, ["run", "app.py", "--fpga-id", "3"], "cmd_run")
+    with pytest.raises(SystemExit) as info:
+        real(args)
+    assert "--fpga-id was removed" in str(info.value)
+
+
+def test_run_no_program_reconnects_to_your_session(monkeypatch):
+    from manhattan_reasoning_gym import _app
+
+    ran = []
+
+    class _FakeApp:
+        api_url, api_key, top, transport = "https://api.example", "k", None, None
+        session_id, _programmed = None, False
+        _entrypoint = staticmethod(lambda: ran.append(True))
+
+        def _program(self):
+            raise AssertionError("must not build")
+
+    fake = _FakeApp()
+    monkeypatch.setattr(
+        _cli, "_load_user_module", lambda path: _app._registry.append(fake)
+    )
+    _sessions(monkeypatch, [SESSION])
+    real = _cli.cmd_run
+    args = _run_main(monkeypatch, ["run", "app.py", "--no-program"], "cmd_run")
+    real(args)
+    assert fake.session_id == SESSION and fake._programmed and ran
+
+
+def test_board_flag_is_passed_through_for_operators(monkeypatch):
+    opened = _patch_open_transport(monkeypatch, _FakeTransport(read_result=[1]))
+    _cli.cmd_read(_rw_args(session=None, board=4))
+    assert opened[0][1] == 4

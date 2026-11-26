@@ -75,7 +75,9 @@ def test_app_forwards_sources(monkeypatch):
 
     submit = Mock(return_value="job")
     monkeypatch.setattr(_app._client, "submit", submit)
-    monkeypatch.setattr(_app._client, "poll_job", Mock(return_value={"fpga_id": 2}))
+    monkeypatch.setattr(
+        _app._client, "poll_job", Mock(return_value={"session_id": "sess-2"})
+    )
     app = _app.App("test", design="design.py", sources=["helper.py"], api_key="key")
     app._program()
     assert submit.call_args.kwargs["sources"] == ["helper.py"]
@@ -93,6 +95,10 @@ def test_cli_appends_repeated_sources(monkeypatch):
         app._entrypoint = lambda: selected.extend(app.sources)
 
     monkeypatch.setattr(_cli, "_load_user_module", load)
+    # --no-program reconnects to the caller's one live session.
+    monkeypatch.setattr(
+        _cli._client, "list_sessions", lambda *a: [{"session_id": "sess-1"}]
+    )
     monkeypatch.setattr(
         sys,
         "argv",
@@ -150,7 +156,9 @@ def test_cli_directory_reaches_submission(monkeypatch):
     submit = Mock(return_value="job")
     monkeypatch.setattr(_cli, "_load_user_module", load)
     monkeypatch.setattr(_app._client, "submit", submit)
-    monkeypatch.setattr(_app._client, "poll_job", Mock(return_value={"fpga_id": 2}))
+    monkeypatch.setattr(
+        _app._client, "poll_job", Mock(return_value={"session_id": "sess-2"})
+    )
     monkeypatch.setattr(
         sys, "argv", ["mrg", "run", "client.py", "--include-dir", "support"]
     )
