@@ -237,6 +237,10 @@ mrg read  <fpga_id> <addr> [--count N]
 mrg write <fpga_id> <addr> <value>
 ```
 
+`mrg status` shows the boards you hold (it needs you signed in: `mrg login`).
+With none it says so; `mrg status --json` then prints `[]`. `mrg status N` and
+`mrg reset N` for a board that isn't yours say so instead of showing it.
+
 Human-readable `mrg status` output includes the server commit from `/health`.
 A package built with local changes is marked `modified source`. Older servers
 or builds without commit metadata show `unknown`; an unavailable health endpoint
