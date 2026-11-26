@@ -42,14 +42,14 @@ export MRG_API_KEY=...        # or: mrg login --github-token <no-scope PAT>
 mrg synth examples/design.py  # JSON report on stdout, ~seconds
 mrg pnr   examples/design.py  # JSON report (fmax_mhz, timing_met), ~tens of seconds
 mrg run   examples/app.py     # programs a real FPGA, ~2-3 min first time
-mrg reset 0                   # free the board when done (async, ~1 min)
+mrg reset                     # free the board when done (async, ~1 min)
 ```
 
 - **All bus addresses are byte addresses**: word *n* in your design's register
   map is byte address `4*n` for `app.read`/`app.write` and `mrg read`/`mrg write`.
 - **After `mrg run` the board stays reserved to you** — reuse it with
   `mrg run --no-program` / `mrg read` / `mrg write`, and release it with
-  `mrg reset <fpga_id>` when done. Reset is an async queued job that reflashes
+  `mrg reset` when done. Reset is an async queued job that reflashes
   the base SoC (~1 min); poll `mrg status --json` rather than expecting
   instant `idle`.
 - `mrg synth` / `mrg pnr` print machine-readable JSON on stdout and exit
@@ -150,8 +150,16 @@ for hz in (50e6, 75e6, 100e6, 120e6, 150e6):
 **Board lifecycle:** the `with app:` form releases the board on exit, but
 `mrg run` does **not** — the reservation persists so you can keep iterating
 with `mrg run --no-program`, `mrg read`, and `mrg write`. Free the board with
-`mrg reset <fpga_id>` (an async job that reflashes the base SoC, ~1 min — poll
+`mrg reset` (an async job that reflashes the base SoC, ~1 min — poll
 `mrg status`).
+
+**Sessions, not boards:** you never pick a board or see which one you got.
+Each reservation is a *session* with a random id (`mrg status` shows its first
+8 characters, `app.session_id` the whole thing). `mrg run --no-program`,
+`mrg read`, `mrg write` and `mrg reset` act on the session you hold; if you
+hold more than one, choose with `--session ID` (the 8-character prefix is
+enough). A session's id stops working the moment it ends, and the next build
+gets a new one.
 
 ### Build locally, run in the cloud: `mrg run --local`
 
@@ -223,23 +231,22 @@ mrg login | logout
 mrg synth <design.py>                       # local synthesis report
 mrg pnr   <design.py> [--sys-clk-mhz N] [--timing-target-mhz N] [--target-mhz N]
                                             # local full-SoC place & route
-mrg run   <file.py> [--no-program [--fpga-id N]]   # --fpga-id only meaningful with --no-program:
-                                                     # a fresh build is never pinned to a board
+mrg run   <file.py> [--no-program] [--session ID]  # reconnect to your session, no rebuild
 mrg run   <file.py> --local                  # build on this machine (Docker), upload, then run
-mrg status [fpga_id] [--json]
+mrg status [SESSION] [--json]
 mrg jobs [--status queued|running|complete|failed|cancelled]
          [--type build|run|reset|all] [-n N | --all] [--json]
                                             # default: your 10 most recent builds
 mrg job <job_id> [--json]
 mrg logs | cancel <job_id>
-mrg reset <fpga_id>
-mrg read  <fpga_id> <addr> [--count N]
-mrg write <fpga_id> <addr> <value>
+mrg reset [SESSION]
+mrg read  <addr> [--count N] [--session ID]
+mrg write <addr> <value> [--session ID]
 ```
 
-`mrg status` shows the boards you hold (it needs you signed in: `mrg login`).
-With none it says so; `mrg status --json` then prints `[]`. `mrg status N` and
-`mrg reset N` for a board that isn't yours say so instead of showing it.
+`mrg status` lists the sessions you hold (it needs you signed in: `mrg login`).
+With none it says so; `mrg status --json` then prints `[]`. A session id that
+has ended, or isn't yours, gets the same "no such session" answer either way.
 
 Human-readable `mrg status` output includes the server commit from `/health`.
 A package built with local changes is marked `modified source`. Older servers

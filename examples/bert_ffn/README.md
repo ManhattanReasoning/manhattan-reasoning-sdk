@@ -67,7 +67,7 @@ mrg run examples/bert_ffn/client_sdk.py
 
 `with app:` releases the session on exit, reflashing the base SoC back to
 `idle`. If a board ever gets stuck in `error`, recover it with
-`mrg reset <fpga_id>`.
+`mrg reset`.
 
 ## Example output
 
@@ -75,7 +75,7 @@ mrg run examples/bert_ffn/client_sdk.py
   input    : 'fpga runs bert'
   tokens   : ['[CLS]', 'f', '##pg', '##a']
   config   : d_model=8  d_ff=32  heads=2  seq=4
-  feed-forward backend: FPGA bert_ffn (fpga0)
+  feed-forward backend: FPGA bert_ffn (session 5f0c6f1e)
   running the FFN sublayer on the accelerator ...
   ...
   FPGA vs golden FFN  : max abs diff = 0.000e+00 (EXACT MATCH)

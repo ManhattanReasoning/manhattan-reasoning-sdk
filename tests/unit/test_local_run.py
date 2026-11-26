@@ -47,7 +47,7 @@ def test_reserve_local_build_posts_with_key(monkeypatch):
     assert res["slot_id"] == 3
     assert seen == {
         "url": "https://api.example/builds/local",
-        "headers": {"X-API-Key": "key"},
+        "headers": {"X-API-Key": "key", "X-MRG-Client-Features": "sessions"},
     }
 
 
@@ -199,7 +199,7 @@ def _wire(monkeypatch, tmp_path, events, *, upload_exc=None, build_exc=None):
     monkeypatch.setattr(_client, "upload_bitstream", upload)
     monkeypatch.setattr(
         _client, "poll_job",
-        lambda job_id, *a, **k: events.append("poll") or {"fpga_id": 2},
+        lambda job_id, *a, **k: events.append("poll") or {"session_id": "sess-2"},
     )
     monkeypatch.setattr(
         _client, "cancel_job", lambda job_id, *a: events.append(("cancel", job_id))
@@ -215,7 +215,7 @@ def test_program_local_reserves_builds_uploads_then_waits(
     assert events == [
         "reserve", ("build", 3), ("upload", "job-0123456789", 3), "poll",
     ]
-    assert local_app.fpga_id == 2 and local_app._programmed
+    assert local_app.session_id == "sess-2" and local_app._programmed
 
 
 def test_failed_local_build_cancels_the_reservation(monkeypatch, tmp_path, local_app):

@@ -15,7 +15,7 @@ Hardware-free smoke test (no FPGA, golden backend -- bit-identical to the board)
     python examples/bert_ffn/client_sdk.py --sim --text "fpga runs bert"
 
 If a run ever leaves the FPGA stuck in ``error``, recover it with
-``mrg reset <fpga_id>``.
+``mrg reset``.
 """
 
 from __future__ import annotations
@@ -89,7 +89,7 @@ def run_pipeline(text: str, *, use_fpga: bool) -> None:
     if use_fpga:
         accel.check_dims(app)
         ffn_fn = lambda x, W1, W2: accel.run_ffn(app, x, W1, W2)  # noqa: E731
-        backend_name = f"FPGA {app.name} (fpga{app.fpga_id})"
+        backend_name = f"FPGA {app.name} (session {app.session_id[:8]})"
     else:
         ffn_fn = accel.sim_ffn
         backend_name = "golden sim (no hardware)"

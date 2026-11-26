@@ -75,13 +75,15 @@ class CloudSilicon:
             except TimeoutError as exc:
                 return {"status": "timeout", "job_id": job_id, "error": str(exc)}
 
-            fpga_id = job["fpga_id"]
-            result = {"status": "programmed", "fpga_id": fpga_id, "job_id": job_id}
+            session_id = job.get("session_id")
+            result = {
+                "status": "programmed", "session_id": session_id, "job_id": job_id,
+            }
 
         if self.release_after:
             # Free the board even if release hiccups; the result still stands.
             try:
-                _client.release_session(fpga_id, self.api_key, api_url)
+                _client.release_session(session_id, self.api_key, api_url)
                 result["released"] = True
             except Exception as exc:
                 result["released"] = False

@@ -36,6 +36,24 @@ _ANIM_INTERVAL = 0.08  # spinner tick when a progress callback is attached
 # the build image, this is the other half of that change.
 DEFAULT_POLL_TIMEOUT = float(os.environ.get("MRG_POLL_TIMEOUT", 14400.0))
 
+# Sent with every build: tells the server this client reaches its board by
+# session id (/sessions/{id}/...), so it may hand it one.
+CLIENT_FEATURES = {"X-MRG-Client-Features": "sessions"}
+
+#: What every board-side call is addressed by. A ``str`` is a session id --
+#: the only kind a regular user has. An ``int`` is a physical board id, which
+#: only admins may use (the server answers anyone else with 410).
+Target = str | int
+
+
+def _target_path(target: Target) -> str:
+    """The API path prefix for a session id (str) or, for admins, a board id."""
+    if isinstance(target, bool) or not isinstance(target, (str, int)):
+        raise TypeError(f"expected a session id or board id, got {target!r}")
+    if isinstance(target, int):
+        return f"/fpga/{target}"
+    return f"/sessions/{target}"
+
 
 def exchange_github_token(github_token: str, api_url: str) -> dict:
     """Exchange a GitHub token for an API key.
@@ -75,10 +93,9 @@ def submit(
     """Submit a design for build_and_program and return its job id.
 
     Never touches a board: the server claims a build slot (a network identity
-    baked into the bitstream) from a pool sized larger than the physical
-    fleet, so many builds run concurrently on Fargate. Which board ends up
-    running the design isn't known until the build finishes and some board's
-    worker claims it -- see ``poll_job``.
+    baked into the bitstream) and runs the build. Once it is flashed, the
+    completed job's ``session_id`` is how you reach the board -- see
+    ``poll_job``. You never choose, or learn, which physical board it is.
 
     ``design_path``'s extension picks the language server-side (.py ->
     Amaranth, .v -> plain Verilog); ``top`` is a Verilog-only top-module
@@ -115,13 +132,14 @@ def submit(
     bundle = source_bundle(design_path, sources, include_dir, single_file_raw=True)
     if bundle is not None:
         resp = requests.post(
-            url, headers={"X-API-Key": api_key},
+            url, headers={"X-API-Key": api_key, **CLIENT_FEATURES},
             files={"file": ("project.zip", bundle, "application/zip")}, data=data,
         )
     else:
         with open(design_path, "rb") as f:
             resp = requests.post(
-                url, headers={"X-API-Key": api_key}, files={"file": f}, data=data
+                url, headers={"X-API-Key": api_key, **CLIENT_FEATURES},
+                files={"file": f}, data=data,
             )
     resp.raise_for_status()
     return resp.json()["job_id"]
@@ -159,7 +177,7 @@ def reserve_local_build(api_key: str, api_url: str) -> dict:
     and ``expires_at`` (the upload deadline).
     """
     resp = requests.post(
-        f"{api_url}/builds/local", headers={"X-API-Key": api_key}
+        f"{api_url}/builds/local", headers={"X-API-Key": api_key, **CLIENT_FEATURES}
     )
     _raise_api_error(resp)
     return resp.json()
@@ -200,12 +218,12 @@ def poll_job(
     deadline is only a backstop for a server that has gone away or a job that
     has wedged, so erring long is deliberate.
 
-    If ``on_poll`` is given it's called as ``on_poll(status, fpga_id)`` on a
-    fast tick (~12/s) so callers can animate a spinner, while the job itself
-    is only queried every ``_BUILD_POLL_INTERVAL`` seconds. ``fpga_id`` is
-    None until a board is assigned (some board's worker has claimed the
-    finished build) -- for a build_and_program job that's anywhere from
-    submit through the build finishing on Fargate.
+    If ``on_poll`` is given it's called as ``on_poll(status)`` on a fast tick
+    (~12/s) so callers can animate a spinner, while the job itself is only
+    queried every ``_BUILD_POLL_INTERVAL`` seconds.
+
+    A completed build_and_program job carries ``session_id``: the handle for
+    the board it was flashed onto.
     """
     if timeout is None:
         timeout = DEFAULT_POLL_TIMEOUT
@@ -214,7 +232,7 @@ def poll_job(
     tick = _ANIM_INTERVAL if on_poll else _BUILD_POLL_INTERVAL
     deadline = time.monotonic() + timeout
     next_check = 0.0
-    job = {"status": "queued", "fpga_id": None}
+    job = {"status": "queued"}
     while time.monotonic() < deadline:
         if time.monotonic() >= next_check:
             resp = requests.get(url, headers=headers)
@@ -223,7 +241,7 @@ def poll_job(
             next_check = time.monotonic() + _BUILD_POLL_INTERVAL
             if job["status"] == "complete":
                 if on_poll:
-                    on_poll(job["status"], job["fpga_id"])
+                    on_poll(job["status"])
                 return job
             if job["status"] in ("failed", "cancelled"):
                 logs_resp = requests.get(f"{url}/logs", headers=headers)
@@ -232,7 +250,7 @@ def poll_job(
                     f"Job {job_id!r} ended with status {job['status']!r}.\n{logs}"
                 )
         if on_poll:
-            on_poll(job["status"], job["fpga_id"])
+            on_poll(job["status"])
         time.sleep(tick)
     # Giving up here says nothing about the job: the server keeps building, and
     # this one may still complete. Say so, so a timeout isn't misread as a
@@ -247,9 +265,10 @@ def poll_job(
 
 
 def read(
-    fpga_id: int, api_key: str, address: int, count: int, api_url: str
+    target: Target, api_key: str, address: int, count: int, api_url: str
 ) -> list[int]:
-    url = f"{api_url}/fpga/{fpga_id}/run"
+    """One Wishbone read as a queued run job on your session's board."""
+    url = f"{api_url}{_target_path(target)}/run"
     resp = requests.post(
         url,
         headers={"X-API-Key": api_key, "Content-Type": "application/json"},
@@ -260,14 +279,15 @@ def read(
 
 
 def write(
-    fpga_id: int,
+    target: Target,
     api_key: str,
     address: int,
     words: list[int],
     api_url: str,
     fixed_address: bool = False,
 ) -> None:
-    url = f"{api_url}/fpga/{fpga_id}/run"
+    """One Wishbone write as a queued run job on your session's board."""
+    url = f"{api_url}{_target_path(target)}/run"
     resp = requests.post(
         url,
         headers={"X-API-Key": api_key, "Content-Type": "application/json"},
@@ -283,13 +303,22 @@ def write(
     _poll_run(resp.json()["job_id"], api_key, api_url)
 
 
+def list_sessions(api_key: str, api_url: str) -> list[dict]:
+    """Your live sessions (usually zero or one), newest first."""
+    resp = requests.get(f"{api_url}/sessions", headers={"X-API-Key": api_key})
+    resp.raise_for_status()
+    return resp.json()
+
+
 def list_fpgas(api_key: str, api_url: str) -> list[dict]:
+    """Every board, by id. Admins only (anyone else gets 410)."""
     resp = requests.get(f"{api_url}/fpga", headers={"X-API-Key": api_key})
     resp.raise_for_status()
     return resp.json()
 
 
 def get_fpga(fpga_id: int, api_key: str, api_url: str) -> dict:
+    """One board, by id. Admins only (anyone else gets 410)."""
     resp = requests.get(f"{api_url}/fpga/{fpga_id}", headers={"X-API-Key": api_key})
     resp.raise_for_status()
     return resp.json()
@@ -339,40 +368,50 @@ def cancel_job(job_id: str, api_key: str, api_url: str) -> None:
     resp.raise_for_status()
 
 
-def get_session(fpga_id: int, api_key: str, api_url: str) -> dict:
-    resp = requests.get(
-        f"{api_url}/fpga/{fpga_id}/session",
-        headers={"X-API-Key": api_key},
-    )
+def get_session(target: Target, api_key: str, api_url: str) -> dict:
+    """A live session: its deadlines and the state of its board.
+
+    404 if the session has ended, isn't yours, or doesn't exist.
+    """
+    path = _target_path(target)
+    if isinstance(target, int):
+        path += "/session"
+    resp = requests.get(f"{api_url}{path}", headers={"X-API-Key": api_key})
     resp.raise_for_status()
     return resp.json()
 
 
-def release_session(fpga_id: int, api_key: str, api_url: str) -> str:
+def release_session(target: Target, api_key: str, api_url: str) -> str:
+    """End a session; the board is wiped and freed. Returns the reset job id."""
+    path = _target_path(target)
+    path += "/session/release" if isinstance(target, int) else "/release"
     resp = requests.post(
-        f"{api_url}/fpga/{fpga_id}/session/release",
-        headers={"X-API-Key": api_key},
-        timeout=10.0,
+        f"{api_url}{path}", headers={"X-API-Key": api_key}, timeout=10.0
     )
     resp.raise_for_status()
     return resp.json()["job_id"]
 
 
-def reset_fpga(fpga_id: int, api_key: str, api_url: str) -> dict:
+def reset_session(target: Target, api_key: str, api_url: str) -> dict:
+    """End a session by resetting its board (reflashes the base image)."""
     resp = requests.post(
-        f"{api_url}/fpga/{fpga_id}/reset",
+        f"{api_url}{_target_path(target)}/reset",
         headers={"X-API-Key": api_key},
         timeout=10.0,
     )
     resp.raise_for_status()
     return resp.json()
+
+
+#: The name this had when boards were addressed by id; same function.
+reset_fpga = reset_session
 
 
 class ReclockError(RuntimeError):
     """A reclock the server refused, or one whose flash failed."""
 
 
-def reclock(fpga_id: int, api_key: str, sys_clk_freq: int, api_url: str) -> dict:
+def reclock(target: Target, api_key: str, sys_clk_freq: int, api_url: str) -> dict:
     """Queue a reflash of a reserved board's build at another user clock (Hz).
 
     Every build is also packed at each clock its PLL reaches without moving the
@@ -385,7 +424,7 @@ def reclock(fpga_id: int, api_key: str, sys_clk_freq: int, api_url: str) -> dict
             e.g. listing the rates this build can reach.
     """
     resp = requests.post(
-        f"{api_url}/fpga/{fpga_id}/reclock",
+        f"{api_url}{_target_path(target)}/reclock",
         headers={"X-API-Key": api_key},
         json={"sys_clk_freq": int(sys_clk_freq)},
         timeout=10.0,
@@ -435,7 +474,7 @@ def _poll_run(job_id: str, api_key: str, api_url: str) -> list[int]:
     raise TimeoutError(f"Run job {job_id!r} did not complete in time")
 
 
-def _ws_url(api_url: str, fpga_id: int) -> str:
+def _ws_url(api_url: str, target: Target) -> str:
     """Convert the orchestrator's http(s):// API URL to its /stream ws(s):// form."""
     if api_url.startswith("https://"):
         base = "wss://" + api_url[len("https://") :]
@@ -443,7 +482,7 @@ def _ws_url(api_url: str, fpga_id: int) -> str:
         base = "ws://" + api_url[len("http://") :]
     else:
         base = api_url
-    return f"{base}/fpga/{fpga_id}/stream"
+    return f"{base}{_target_path(target)}/stream"
 
 
 def get_health(api_url: str) -> dict:

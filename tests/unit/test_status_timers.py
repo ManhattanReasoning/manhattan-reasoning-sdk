@@ -9,6 +9,7 @@ import requests
 from manhattan_reasoning_gym import _cli, _client
 
 NOW = datetime(2026, 10, 11, 12, 0, tzinfo=UTC)
+SESSION = "5f0c6f1e-2b7a-4c1e-9d8f-3a2b1c0d9e8f"
 
 
 @pytest.mark.parametrize(
@@ -49,14 +50,13 @@ def setup_status(monkeypatch):
         _cli, "_creds_optional", lambda args: ("key", "https://example")
     )
     board = {
-        "fpga_id": 0,
+        "session_id": SESSION,
         "state": "reserved",
-        "owner": "alice",
-        "session": {"created_at": "2026-10-11T11:30:00Z"},
+        "created_at": "2026-10-11T11:30:00Z",
         "current_job_id": None,
     }
-    monkeypatch.setattr(_client, "list_fpgas", lambda *args: [board])
-    monkeypatch.setattr(_client, "get_fpga", lambda *args: board)
+    monkeypatch.setattr(_client, "list_sessions", lambda *args: [board])
+    monkeypatch.setattr(_client, "get_session", lambda *args: board)
     jobs = Mock(
         return_value=[
             {
@@ -74,13 +74,13 @@ def setup_status(monkeypatch):
     return board, jobs
 
 
-@pytest.mark.parametrize("fpga_id", [None, 0])
-def test_status_displays_reservation_timer(setup_status, capsys, fpga_id):
+@pytest.mark.parametrize("session", [None, SESSION])
+def test_status_displays_reservation_timer(setup_status, capsys, session):
     board, jobs = setup_status
-    _cli.cmd_status(argparse.Namespace(fpga_id=fpga_id, json=False))
+    _cli.cmd_status(argparse.Namespace(session=session, json=False))
     out = capsys.readouterr().out
     assert "00:30:00" in out
-    if fpga_id is None:
+    if session is None:
         assert "00:05:00" in out and "nextpnr" in out
         assert "finished" not in out
         jobs.assert_called_once_with("key", "https://example", timeout=3)
@@ -90,17 +90,17 @@ def test_status_displays_reservation_timer(setup_status, capsys, fpga_id):
 
 def test_missing_legacy_timestamps_show_unknown(setup_status, capsys):
     board, _ = setup_status
-    board["session"] = {"expires_at": "2026-10-11T13:00:00Z"}
-    _cli.cmd_status(argparse.Namespace(fpga_id=0, json=False))
+    del board["created_at"]
+    _cli.cmd_status(argparse.Namespace(session=SESSION, json=False))
     assert "held for:      -" in capsys.readouterr().out
 
 
-@pytest.mark.parametrize("fpga_id", [None, 0])
-def test_json_preserves_response_without_extra_requests(setup_status, capsys, fpga_id):
+@pytest.mark.parametrize("session", [None, SESSION])
+def test_json_preserves_response_without_extra_requests(setup_status, capsys, session):
     board, jobs = setup_status
-    _cli.cmd_status(argparse.Namespace(fpga_id=fpga_id, json=True))
+    _cli.cmd_status(argparse.Namespace(session=session, json=True))
     assert json.loads(capsys.readouterr().out) == (
-        [board] if fpga_id is None else board
+        [board] if session is None else board
     )
     jobs.assert_not_called()
 
@@ -108,7 +108,7 @@ def test_json_preserves_response_without_extra_requests(setup_status, capsys, fp
 def test_failed_jobs_lookup_does_not_hide_board_status(setup_status, capsys):
     _, jobs = setup_status
     jobs.side_effect = requests.Timeout()
-    _cli.cmd_status(argparse.Namespace(fpga_id=None, json=False))
+    _cli.cmd_status(argparse.Namespace(session=None, json=False))
     output = capsys.readouterr().out
     assert "reserved" in output and "active builds: unavailable" in output
 
@@ -118,7 +118,7 @@ def test_anonymous_status_does_not_fetch_private_jobs(
 ):
     _, jobs = setup_status
     monkeypatch.setattr(_cli, "_creds_optional", lambda args: (None, "https://example"))
-    _cli.cmd_status(argparse.Namespace(fpga_id=None, json=False))
+    _cli.cmd_status(argparse.Namespace(session=None, json=False))
     jobs.assert_not_called()
     assert "reserved" in capsys.readouterr().out
 
@@ -130,7 +130,7 @@ def test_job_commands_show_elapsed_without_changing_json(
 ):
     job = {
         "job_id": "abcdefgh-full",
-        "fpga_id": None,
+        "session_id": SESSION,
         "type": "build_and_program",
         "status": "complete",
         "created_at": "2026-10-10T10:00:00Z",
@@ -149,3 +149,4 @@ def test_job_commands_show_elapsed_without_changing_json(
         assert json.loads(output) == ([job] if command == "jobs" else job)
     else:
         assert "00:02:00" in output
+        assert SESSION[:8] in output and "fpga" not in output.lower()
