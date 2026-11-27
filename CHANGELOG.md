@@ -1,6 +1,18 @@
 # Changelog
 
-## 0.2.0 (unreleased)
+## 0.2.1
+
+### Fixed
+
+- `mrg job`, `mrg logs` and `mrg cancel` accept the short job id that
+  `mrg jobs` prints (any unique prefix), instead of failing with a 422.
+- Waiting for a build no longer gives up on the first dropped connection or
+  gateway error: it keeps polling through up to 5 minutes of outage (for
+  example a server restart), since the build keeps running server-side.
+- `mrg logs`, and the log shown when a build fails, print as text instead of
+  one line of escaped `\n`s.
+
+## 0.2.0
 
 Boards are now reached through **sessions**, not board numbers. You never
 choose a board or learn which one you got: the server assigns one when your

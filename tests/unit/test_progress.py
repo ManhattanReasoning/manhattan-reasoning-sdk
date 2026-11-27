@@ -78,6 +78,7 @@ class _Resp:
         self._session_id = session_id
         self.text = text
         self.ok = True
+        self.status_code = 200
 
     def raise_for_status(self):
         pass
