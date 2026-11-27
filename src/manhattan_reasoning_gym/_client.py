@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import time
+import uuid
 
 import requests
 
@@ -35,6 +36,13 @@ _ANIM_INTERVAL = 0.08  # spinner tick when a progress callback is attached
 # NOTE: if you change BUILD_TIMEOUT_SECONDS or BUILD_SYNTH_TIMEOUT_SECONDS in
 # the build image, this is the other half of that change.
 DEFAULT_POLL_TIMEOUT = float(os.environ.get("MRG_POLL_TIMEOUT", 14400.0))
+
+# poll_job keeps going through connection errors and gateway errors (a server
+# restart during a deploy, a network blip) for this long before giving up.
+_POLL_OUTAGE_GRACE = 300.0
+_RETRY_STATUSES = frozenset({502, 503, 504})
+# Per-request cap, so one hung connection can't stall a poll loop forever.
+_REQUEST_TIMEOUT = 30.0
 
 # Sent with every build: tells the server this client reaches its board by
 # session id (/sessions/{id}/...), so it may hand it one.
@@ -232,20 +240,37 @@ def poll_job(
     tick = _ANIM_INTERVAL if on_poll else _BUILD_POLL_INTERVAL
     deadline = time.monotonic() + timeout
     next_check = 0.0
+    failing_since: float | None = None
     job = {"status": "queued"}
     while time.monotonic() < deadline:
         if time.monotonic() >= next_check:
-            resp = requests.get(url, headers=headers)
+            next_check = time.monotonic() + _BUILD_POLL_INTERVAL
+            try:
+                resp = requests.get(url, headers=headers, timeout=_REQUEST_TIMEOUT)
+                if resp.status_code in _RETRY_STATUSES:
+                    raise requests.ConnectionError(f"HTTP {resp.status_code}")
+            except (requests.ConnectionError, requests.Timeout):
+                # A dropped connection or a restarting server says nothing
+                # about the build, which keeps running server-side. Keep
+                # polling through a short outage instead of abandoning it.
+                now = time.monotonic()
+                failing_since = failing_since or now
+                if now - failing_since > _POLL_OUTAGE_GRACE:
+                    raise
+                if on_poll:
+                    on_poll(job["status"])
+                time.sleep(tick)
+                continue
+            failing_since = None
             resp.raise_for_status()
             job = resp.json()
-            next_check = time.monotonic() + _BUILD_POLL_INTERVAL
             if job["status"] == "complete":
                 if on_poll:
                     on_poll(job["status"])
                 return job
             if job["status"] in ("failed", "cancelled"):
                 logs_resp = requests.get(f"{url}/logs", headers=headers)
-                logs = logs_resp.text if logs_resp.ok else "no logs available"
+                logs = _log_text(logs_resp) if logs_resp.ok else "no logs available"
                 raise RuntimeError(
                     f"Job {job_id!r} ended with status {job['status']!r}.\n{logs}"
                 )
@@ -324,6 +349,34 @@ def get_fpga(fpga_id: int, api_key: str, api_url: str) -> dict:
     return resp.json()
 
 
+def resolve_job_id(job_id: str, api_key: str, api_url: str) -> str:
+    """Turn a job id or a unique prefix of one (as ``mrg jobs`` prints) into
+    the full id.
+
+    Raises:
+        ValueError: If no job, or more than one, starts with ``job_id``.
+    """
+    prefix = job_id.strip().rstrip("…").rstrip(".").lower()
+    try:
+        return str(uuid.UUID(prefix))
+    except ValueError:
+        pass
+    if not prefix:
+        raise ValueError("empty job id")
+    matches = [
+        j["job_id"] for j in list_jobs(api_key, api_url)
+        if str(j.get("job_id", "")).lower().startswith(prefix)
+    ]
+    if not matches:
+        raise ValueError(f"no job of yours starts with {job_id!r}")
+    if len(matches) > 1:
+        raise ValueError(
+            f"{len(matches)} of your jobs start with {job_id!r}; "
+            f"use more characters"
+        )
+    return matches[0]
+
+
 def get_job(job_id: str, api_key: str, api_url: str) -> dict:
     resp = requests.get(
         f"{api_url}/jobs/{job_id}",
@@ -357,6 +410,19 @@ def get_logs(job_id: str, api_key: str, api_url: str) -> str:
         headers={"X-API-Key": api_key},
     )
     resp.raise_for_status()
+    return _log_text(resp)
+
+
+def _log_text(resp) -> str:
+    """The log as plain text. The server sends it as a JSON string, which
+    printed raw is one line of escaped ``\\n``s."""
+    if "json" in (getattr(resp, "headers", None) or {}).get("content-type", ""):
+        try:
+            body = resp.json()
+        except ValueError:
+            return resp.text
+        if isinstance(body, str):
+            return body
     return resp.text
 
 

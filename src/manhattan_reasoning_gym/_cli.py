@@ -546,9 +546,25 @@ def cmd_jobs(args: argparse.Namespace) -> None:
     print()
 
 
+def _job_id(args: argparse.Namespace, api_key: str, api_url: str) -> str:
+    """The full job id for ``args.job_id``, which may be the short form
+    ``mrg jobs`` prints (a unique prefix)."""
+    try:
+        return _client.resolve_job_id(args.job_id, api_key, api_url)
+    except ValueError as exc:
+        sys.exit(f"error: {exc}.\n  'mrg jobs' lists your jobs.")
+    except requests.HTTPError as exc:
+        if exc.response is not None and exc.response.status_code == 401:
+            sys.exit(
+                "error: a short job id needs you to be signed in; pass the "
+                "full id or run 'mrg login'."
+            )
+        raise
+
+
 def cmd_job(args: argparse.Namespace) -> None:
     api_key, api_url = _creds_optional(args)
-    d = _client.get_job(args.job_id, api_key, api_url)
+    d = _client.get_job(_job_id(args, api_key, api_url), api_key, api_url)
     if args.json:
         print(json.dumps(d, indent=2))
         return
@@ -570,14 +586,15 @@ def cmd_job(args: argparse.Namespace) -> None:
 
 def cmd_logs(args: argparse.Namespace) -> None:
     api_key, api_url = _creds_optional(args)
-    text = _client.get_logs(args.job_id, api_key, api_url)
+    text = _client.get_logs(_job_id(args, api_key, api_url), api_key, api_url)
     print(text)
 
 
 def cmd_cancel(args: argparse.Namespace) -> None:
     api_key, api_url = _creds(args)
-    _client.cancel_job(args.job_id, api_key, api_url)
-    print(f"cancelled {args.job_id}")
+    job_id = _job_id(args, api_key, api_url)
+    _client.cancel_job(job_id, api_key, api_url)
+    print(f"cancelled {job_id}")
 
 
 def cmd_reset(args: argparse.Namespace) -> None:
@@ -831,17 +848,17 @@ def main() -> None:
 
     # job <job_id>
     job_p = sub.add_parser("job", parents=[common], help="show job status and metadata")
-    job_p.add_argument("job_id")
+    job_p.add_argument("job_id", help="full id or the short id from 'mrg jobs'")
     job_p.add_argument("--json", action="store_true",
                        help="print the raw orchestrator response as JSON")
 
     # logs <job_id>
     log_p = sub.add_parser("logs", parents=[common], help="print build logs for a job")
-    log_p.add_argument("job_id")
+    log_p.add_argument("job_id", help="full id or the short id from 'mrg jobs'")
 
     # cancel <job_id>
     can_p = sub.add_parser("cancel", parents=[common], help="cancel a job")
-    can_p.add_argument("job_id")
+    can_p.add_argument("job_id", help="full id or the short id from 'mrg jobs'")
 
     # reset [session]
     res_p = sub.add_parser(
