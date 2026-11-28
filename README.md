@@ -187,7 +187,7 @@ identity ROM):
    path is printed, and so is a timing/utilisation summary (Fmax per clock,
    resource use, stage times).
 2. Creates the job (`POST /builds/local`), retrying for up to 10 minutes while
-   the server answers `503 no_build_capacity`.
+   the server answers `503 no_build_capacity` or `402 build_in_flight`.
 3. Uploads the bitstream and manifest (`PUT /jobs/{job_id}/bitstream`). The
    server answers `queued`, flashes a board, and the job ends `complete`.
 4. Waits for the board, then runs your `@app.local_entrypoint()` as usual.
@@ -195,7 +195,8 @@ identity ROM):
 If the server still hands out a build slot in step 2 (a server from before
 flash-time identity), the SDK writes that slot's identity into the finished
 bitstream itself (`ecpbram` in the build image, a few seconds, verified) and
-uploads `design.slot<N>.bit`. With an older build image that has no identity
+uploads `design.slot<N>.bit` (with `manifest.slot<N>.json`; `design.bit` and
+`manifest.json` stay as built). With an older build image that has no identity
 ROM, the SDK falls back to the old order: reserve a slot, build for it, upload
 before the deadline (30 min by default; past it the upload gets `410` and you
 run `mrg run --local` again).
@@ -203,7 +204,11 @@ run `mrg run --local` again).
 In Python, use `mrg.cloud.App(..., local=True)`. Notes:
 
 - Needs Docker. Set `$MRG_LOCAL_BUILD_IMAGE` to use another image tag or digest.
-- One local build in flight per user; a second reserve gets `402 build_in_flight`.
+- One local build in flight per user: the server answers a second job
+  request with `402 build_in_flight`. With a flash-time-identity image two
+  `mrg run --local` can build at once; the second waits (up to 10 minutes)
+  for the first to finish flashing before it creates its job. If it gives up,
+  the error says where the built bitstream is.
 - Single design file only (`--include-dir` / `--source` are not supported yet).
 
 ## Authentication (cloud only)

@@ -9,7 +9,13 @@
   A long build can no longer outlive its reservation. Against a server that
   still reserves a build slot, the slot's identity is written into the
   finished bitstream (no rebuild); with an older image the old
-  reserve-then-build order is kept.
+  reserve-then-build order is kept. After the build, a full server
+  (`503 no_build_capacity`) or another build of yours still flashing
+  (`402 build_in_flight`) is retried for up to 10 minutes; if it still fails,
+  the error says where the built bitstream is.
+- A flash-time-identity image whose placeholder is not the pinned one
+  (sha256 `e54a7cff...`) is refused before building: the board host would
+  refuse to flash its bitstreams.
 - A successful local build prints a timing/utilisation summary and writes it
   to `build.log` (which used to be empty on success).
 

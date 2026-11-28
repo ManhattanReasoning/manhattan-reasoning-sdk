@@ -31,6 +31,13 @@ def _placeholder(seed=1296191305):
 
 PLACEHOLDER = _placeholder()
 
+# The real, board-tested placeholder (mrg-sandbox
+# firmware/src/cloud_fpga_firmware/identity_placeholder.hex).
+REAL_PLACEHOLDER_TEXT = (
+    Path(__file__).parent / "data" / "identity_placeholder.hex"
+).read_text()
+REAL_PLACEHOLDER = _local_bitstream.parse_identity_hex(REAL_PLACEHOLDER_TEXT)
+
 # The tail of a real nextpnr run: a pre-route estimate, then the final report.
 _FMAX = "Info: Max frequency for clock {:>40}: {} MHz (PASS at {} MHz)"
 _ETH = "'$glbnet$eth_clocks_ref_clk$TRELLIS_IO_IN'"
@@ -327,12 +334,46 @@ def _fake_probe(monkeypatch, rc, stdout=""):
 
 
 def test_probe_reads_the_placeholder_from_the_image(monkeypatch):
-    text = "".join(f"{w:08x}\n" for w in PLACEHOLDER)
-    calls = _fake_probe(monkeypatch, 0, text)
-    assert _local_bitstream.identity_placeholder("sha256:img") == PLACEHOLDER
+    calls = _fake_probe(monkeypatch, 0, REAL_PLACEHOLDER_TEXT)
+    assert _local_bitstream.identity_placeholder("sha256:img") == REAL_PLACEHOLDER
     (cmd,) = calls
     assert "--network=none" in cmd and "sha256:img" in cmd
     assert "identity_placeholder.hex" in cmd[-1]
+
+
+def test_probe_refuses_a_placeholder_that_is_not_the_pinned_one(monkeypatch):
+    # Valid shape and distinct columns, but not the placeholder the board
+    # host pins: its bitstreams would be refused at flash time.
+    _fake_probe(monkeypatch, 0, "".join(f"{w:08x}\n" for w in PLACEHOLDER))
+    with pytest.raises(_local_bitstream.LocalBuildError, match="not the pinned"):
+        _local_bitstream.identity_placeholder("sha256:img")
+
+
+def test_pinned_placeholder_matches_the_firmware_copy():
+    assert (
+        hashlib.sha256(REAL_PLACEHOLDER_TEXT.encode()).hexdigest()
+        == _local_bitstream.PLACEHOLDER_SHA256
+    )
+    assert REAL_PLACEHOLDER[0] == 0x75064692
+
+
+def test_identity_image_for_board_0_matches_the_board_tested_one():
+    # identity_0.hex as flashed and run on a real board (prototype), byte
+    # for byte: header as the firmware's identity.h decodes it, then the
+    # NOT-placeholder padding.
+    words = _local_bitstream.identity_words(
+        0, "192.168.1.101", "02:00:00:00:00:01", REAL_PLACEHOLDER
+    )
+    assert words[:7] == [
+        0x4D524749, 0x00000001, 0x00000000, 0xC0A80165,
+        0x00000200, 0x00000001, 0x7205BBD3,
+    ]
+    text = "".join(f"{w:08x}\n" for w in words)
+    assert hashlib.sha256(text.encode()).hexdigest() == (
+        "6aa82af676931c93f666836e8768c06bc908304a2ee43d902d60df8812fe4a35"
+    )
+    # Its columns are distinct too, so ecpbram can find it again (verify).
+    _local_bitstream.parse_identity_hex(text)
 
 
 def test_probe_returns_none_for_a_build_time_identity_image(monkeypatch):
@@ -381,7 +422,8 @@ def test_patch_identity_writes_slot_identity_and_manifest(monkeypatch, tmp_path)
     assert patched.path == out / "design.slot3.bit"
     assert patched.manifest["slot_id"] == 3
     assert patched.manifest["bitstream_sha256"] == hashlib.sha256(PATCHED).hexdigest()
-    assert json.loads((out / "manifest.json").read_text()) == patched.manifest
+    assert json.loads((out / "manifest.slot3.json").read_text()) == patched.manifest
+    assert not (out / "manifest.json").exists()  # design.bit's, left alone
     ident = _local_bitstream.parse_identity_hex((out / "identity_3.hex").read_text())
     assert ident[3] == 0xC0A80168
     on_disk = (out / "identity_placeholder.hex").read_text()
@@ -614,14 +656,46 @@ def test_build_first_waits_out_a_full_server(monkeypatch, tmp_path, local_app):
     assert events[-1] == "poll"
 
 
+def test_build_first_waits_for_its_own_other_build(monkeypatch, tmp_path, local_app):
+    # Builds hold nothing on the server, so two local runs can build at once;
+    # the second must not throw its bitstream away on 402 build_in_flight.
+    events = []
+    busy = _client.LocalBuildAPIError(402, "build_in_flight", "busy")
+    _wire(monkeypatch, tmp_path, events, placeholder=PLACEHOLDER,
+          reservation=NEW_RESERVATION, reserve_excs=[busy])
+    local_app._program()
+    assert events[:4] == [
+        ("build", None, "sha256:img"),
+        ("reserve", True), ("sleep", _app._RESERVE_RETRY_EVERY),
+        ("reserve", True),
+    ]
+    assert events[-1] == "poll"
+
+
+def test_build_first_gives_up_after_the_retry_window(
+    monkeypatch, tmp_path, local_app
+):
+    events = []
+    full = _client.LocalBuildAPIError(503, "no_build_capacity", "full")
+    _wire(monkeypatch, tmp_path, events, placeholder=PLACEHOLDER,
+          reserve_excs=[full] * 3)
+    monkeypatch.setattr(_app, "_RESERVE_RETRY_FOR", 0.0)
+    with pytest.raises(_client.LocalBuildAPIError) as info:
+        local_app._program()
+    assert info.value.code == "no_build_capacity"
+    assert str(tmp_path / "design.bit") in str(info.value)
+    assert events == [("build", None, "sha256:img"), ("reserve", True)]
+
+
 def test_build_first_does_not_retry_other_reserve_errors(
     monkeypatch, tmp_path, local_app
 ):
     events = []
-    busy = _client.LocalBuildAPIError(402, "build_in_flight", "busy")
-    _wire(monkeypatch, tmp_path, events, placeholder=PLACEHOLDER, reserve_excs=[busy])
-    with pytest.raises(_client.LocalBuildAPIError, match="busy"):
+    spent = _client.LocalBuildAPIError(402, "quota_exhausted", "spent")
+    _wire(monkeypatch, tmp_path, events, placeholder=PLACEHOLDER, reserve_excs=[spent])
+    with pytest.raises(_client.LocalBuildAPIError, match="spent") as info:
         local_app._program()
+    assert "kept at" in str(info.value)
     assert events == [("build", None, "sha256:img"), ("reserve", True)]
 
 

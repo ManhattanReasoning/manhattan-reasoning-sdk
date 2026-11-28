@@ -160,6 +160,7 @@ class LocalBuildAPIError(RuntimeError):
         super().__init__(f"{message} ({status} {code})")
         self.status = status
         self.code = code
+        self.message = message
 
 
 def _raise_api_error(resp) -> None:

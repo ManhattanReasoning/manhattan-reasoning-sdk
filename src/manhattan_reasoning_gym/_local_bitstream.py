@@ -66,6 +66,16 @@ _PROBE_SCRIPT = (
 )
 _PROBE_ABSENT = 3
 
+#: sha256 of the one placeholder every flash-time-identity SoC bakes in
+#: (mrg-sandbox ``cloud_fpga_firmware/identity_placeholder.hex``, generated
+#: once with ``ecpbram -g ... -w 32 -d 512 -s 1296191305``). It is fixed
+#: forever and the board host pins the same hash, so it refuses to flash a
+#: bitstream carrying any other pattern: an image with a different placeholder
+#: is refused here, before a build that could never be flashed.
+PLACEHOLDER_SHA256 = (
+    "e54a7cffc8d2a54a770774b89a03d968002ca0e68c7a33223a90e2660201a54d"
+)
+
 # Runs inside the image. Calls the build server's own pipeline; prints the
 # failing stage and its log on error so the user sees why a build broke.
 # Passes the slot only to a pipeline that still takes one (an empty slot means
@@ -247,6 +257,14 @@ def identity_placeholder(image: str) -> list[int] | None:
             f"could not inspect the local build image (rc={proc.returncode}): "
             f"{proc.stderr.strip()[-300:]}"
         )
+    digest = hashlib.sha256(proc.stdout.encode()).hexdigest()
+    if digest != PLACEHOLDER_SHA256:
+        raise LocalBuildError(
+            f"the local build image's identity placeholder (sha256 {digest}) "
+            f"is not the pinned one ({PLACEHOLDER_SHA256}); the board host "
+            "would refuse to flash its bitstreams. Rebuild the image from the "
+            "current Cloud repo."
+        )
     return parse_identity_hex(proc.stdout)
 
 
@@ -304,8 +322,9 @@ def patch_identity(
 
     For a server that still reserves a build slot: the same swap its board
     host makes once identity is assigned at flash time. Leaves the pristine
-    ``design.bit`` in place and writes ``design.slot<N>.bit`` beside it;
-    returns that, with a manifest for the slot. Refuses (``IdentityPatchError``)
+    ``design.bit`` (and its ``manifest.json``) in place and writes
+    ``design.slot<N>.bit`` and ``manifest.slot<N>.json`` beside them;
+    returns that bitstream with the slot's manifest. Refuses (``IdentityPatchError``)
     unless the placeholder is in the bitstream exactly once.
     """
     out_dir = built.path.parent
@@ -334,7 +353,10 @@ def patch_identity(
     manifest = dict(built.manifest)
     manifest["slot_id"] = slot_id
     manifest["bitstream_sha256"] = hashlib.sha256(patched.read_bytes()).hexdigest()
-    (out_dir / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
+    # manifest.json keeps describing the pristine design.bit next to it.
+    (out_dir / f"manifest.slot{slot_id}.json").write_text(
+        json.dumps(manifest, indent=2) + "\n"
+    )
     return LocalBitstream(path=patched, manifest=manifest, summary=built.summary)
 
 

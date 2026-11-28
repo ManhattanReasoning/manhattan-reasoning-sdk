@@ -372,7 +372,9 @@ class App:
             flush=True,
         )
         built = self._local_build(out_dir, image, None)
-        res = _reserve_after_build(self.name, self.api_key, self.api_url)
+        res = _reserve_after_build(
+            self.name, self.api_key, self.api_url, built.path
+        )
         job_id = res["job_id"]
         try:
             slot_id = res.get("slot_id")
@@ -585,15 +587,28 @@ class App:
 
 
 #: After a local build, how long to keep asking for a job while the server
-#: has no build capacity, and how often. The bitstream is already built, so
-#: waiting a while beats throwing it away.
+#: says "not now", and how often. The bitstream is already built, so waiting
+#: a while beats throwing it away.
 _RESERVE_RETRY_FOR = 600.0
 _RESERVE_RETRY_EVERY = 15.0
 
+#: Reservation refusals that clear by themselves: the slot pool is full, or
+#: this account's other build (e.g. a second ``mrg run --local`` started
+#: alongside this one -- builds no longer hold anything on the server, so two
+#: can now run at once) has not finished flashing yet.
+_RESERVE_RETRY_CODES = {
+    "no_build_capacity": "no build capacity on the server yet",
+    "build_in_flight": "another build of yours is still in flight",
+}
 
-def _reserve_after_build(name: str, api_key: str, api_url: str) -> dict:
+
+def _reserve_after_build(
+    name: str, api_key: str, api_url: str, bitstream: Path | None = None
+) -> dict:
     """``reserve_local_build`` for a finished flash-time-identity bitstream,
-    retrying while the server answers ``503 no_build_capacity``."""
+    retrying while the server answers ``503 no_build_capacity`` or
+    ``402 build_in_flight``. If it gives up, the error says where the built
+    bitstream is."""
     deadline = time.monotonic() + _RESERVE_RETRY_FOR
     while True:
         try:
@@ -601,11 +616,16 @@ def _reserve_after_build(name: str, api_key: str, api_url: str) -> dict:
                 api_key, api_url, flash_identity=True
             )
         except _client.LocalBuildAPIError as exc:
-            if exc.code != "no_build_capacity" or time.monotonic() >= deadline:
-                raise
+            reason = _RESERVE_RETRY_CODES.get(exc.code)
+            if reason is None or time.monotonic() >= deadline:
+                if bitstream is None:
+                    raise
+                raise _client.LocalBuildAPIError(
+                    exc.status, exc.code,
+                    f"{exc.message}. The bitstream was built and kept at {bitstream}",
+                ) from exc
         print(
-            f"[{name}] no build capacity on the server yet; retrying in "
-            f"{_RESERVE_RETRY_EVERY:.0f}s",
+            f"[{name}] {reason}; retrying in {_RESERVE_RETRY_EVERY:.0f}s",
             flush=True,
         )
         time.sleep(_RESERVE_RETRY_EVERY)
