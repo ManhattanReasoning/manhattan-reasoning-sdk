@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import json
 import os
 import time
+import uuid
 
 import requests
 
@@ -34,6 +36,31 @@ _ANIM_INTERVAL = 0.08  # spinner tick when a progress callback is attached
 # NOTE: if you change BUILD_TIMEOUT_SECONDS or BUILD_SYNTH_TIMEOUT_SECONDS in
 # the build image, this is the other half of that change.
 DEFAULT_POLL_TIMEOUT = float(os.environ.get("MRG_POLL_TIMEOUT", 14400.0))
+
+# poll_job keeps going through connection errors and gateway errors (a server
+# restart during a deploy, a network blip) for this long before giving up.
+_POLL_OUTAGE_GRACE = 300.0
+_RETRY_STATUSES = frozenset({502, 503, 504})
+# Per-request cap, so one hung connection can't stall a poll loop forever.
+_REQUEST_TIMEOUT = 30.0
+
+# Sent with every build: tells the server this client reaches its board by
+# session id (/sessions/{id}/...), so it may hand it one.
+CLIENT_FEATURES = {"X-MRG-Client-Features": "sessions"}
+
+#: What every board-side call is addressed by. A ``str`` is a session id --
+#: the only kind a regular user has. An ``int`` is a physical board id, which
+#: only admins may use (the server answers anyone else with 410).
+Target = str | int
+
+
+def _target_path(target: Target) -> str:
+    """The API path prefix for a session id (str) or, for admins, a board id."""
+    if isinstance(target, bool) or not isinstance(target, (str, int)):
+        raise TypeError(f"expected a session id or board id, got {target!r}")
+    if isinstance(target, int):
+        return f"/fpga/{target}"
+    return f"/sessions/{target}"
 
 
 def exchange_github_token(github_token: str, api_url: str) -> dict:
@@ -68,19 +95,26 @@ def submit(
     *,
     sources: list[str] | None = None,
     include_dir: str | None = None,
+    command: str | None = None,
+    project: str | None = None,
 ) -> str:
     """Submit a design for build_and_program and return its job id.
 
     Never touches a board: the server claims a build slot (a network identity
-    baked into the bitstream) from a pool sized larger than the physical
-    fleet, so many builds run concurrently on Fargate. Which board ends up
-    running the design isn't known until the build finishes and some board's
-    worker claims it -- see ``poll_job``.
+    baked into the bitstream) and runs the build. Once it is flashed, the
+    completed job's ``session_id`` is how you reach the board -- see
+    ``poll_job``. You never choose, or learn, which physical board it is.
 
     ``design_path``'s extension picks the language server-side (.py ->
     Amaranth, .v -> plain Verilog); ``top`` is a Verilog-only top-module
     disambiguator (ignored for Amaranth), only needed when the file has more
     than one module exposing the required Wishbone contract.
+
+    ``command`` and ``project`` are only for the web dashboard, which shows
+    them with the build: the command line that started it and the project
+    name. ``App`` sends both, with secret values in the command hidden
+    (``_app._command_line``); a build submitted without them shows neither.
+    Both are cut to the length the server keeps.
     """
     # Inspect local dependencies without importing or executing the design.
     url = f"{api_url}/submit"
@@ -95,22 +129,81 @@ def submit(
         data["sys_clk_freq"] = str(sys_clk_freq)
     if timing_target_mhz:
         data["timing_target_mhz"] = str(timing_target_mhz)
+    # Shown on the web dashboard; older servers ignore them.
+    if command:
+        data["command"] = command[:1000]
+    if project:
+        data["project"] = project[:100]
     data = data or None
     from ._project import source_bundle
 
     bundle = source_bundle(design_path, sources, include_dir, single_file_raw=True)
     if bundle is not None:
         resp = requests.post(
-            url, headers={"X-API-Key": api_key},
+            url, headers={"X-API-Key": api_key, **CLIENT_FEATURES},
             files={"file": ("project.zip", bundle, "application/zip")}, data=data,
         )
     else:
         with open(design_path, "rb") as f:
             resp = requests.post(
-                url, headers={"X-API-Key": api_key}, files={"file": f}, data=data
+                url, headers={"X-API-Key": api_key, **CLIENT_FEATURES},
+                files={"file": f}, data=data,
             )
     resp.raise_for_status()
     return resp.json()["job_id"]
+
+
+class LocalBuildAPIError(RuntimeError):
+    """The server refused a local-build call; ``code`` is its error code."""
+
+    def __init__(self, status: int, code: str, message: str) -> None:
+        super().__init__(f"{message} ({status} {code})")
+        self.status = status
+        self.code = code
+
+
+def _raise_api_error(resp) -> None:
+    if resp.ok:
+        return
+    try:
+        detail = resp.json().get("detail") or {}
+    except ValueError:
+        detail = {}
+    if not isinstance(detail, dict):
+        detail = {"message": str(detail)}
+    raise LocalBuildAPIError(
+        resp.status_code,
+        detail.get("error", "http_error"),
+        detail.get("message", resp.reason or "request failed"),
+    )
+
+
+def reserve_local_build(api_key: str, api_url: str) -> dict:
+    """Reserve a build slot for a build that runs on this machine.
+
+    Returns ``job_id``, ``slot_id`` (bake it in as FPGA_ID), ``ip``, ``mac``
+    and ``expires_at`` (the upload deadline).
+    """
+    resp = requests.post(
+        f"{api_url}/builds/local", headers={"X-API-Key": api_key, **CLIENT_FEATURES}
+    )
+    _raise_api_error(resp)
+    return resp.json()
+
+
+def upload_bitstream(
+    job_id: str, bitstream_path, manifest: dict, api_key: str, api_url: str
+) -> dict:
+    """Upload a locally built ``.bit`` and its manifest; the server queues a flash."""
+    with open(bitstream_path, "rb") as f:
+        resp = requests.put(
+            f"{api_url}/jobs/{job_id}/bitstream",
+            headers={"X-API-Key": api_key},
+            files={"file": (os.path.basename(str(bitstream_path)), f)},
+            data={"manifest": json.dumps(manifest)},
+        )
+    _raise_api_error(resp)
+    return resp.json()
 
 
 def poll_job(
@@ -133,12 +226,12 @@ def poll_job(
     deadline is only a backstop for a server that has gone away or a job that
     has wedged, so erring long is deliberate.
 
-    If ``on_poll`` is given it's called as ``on_poll(status, fpga_id)`` on a
-    fast tick (~12/s) so callers can animate a spinner, while the job itself
-    is only queried every ``_BUILD_POLL_INTERVAL`` seconds. ``fpga_id`` is
-    None until a board is assigned (some board's worker has claimed the
-    finished build) -- for a build_and_program job that's anywhere from
-    submit through the build finishing on Fargate.
+    If ``on_poll`` is given it's called as ``on_poll(status)`` on a fast tick
+    (~12/s) so callers can animate a spinner, while the job itself is only
+    queried every ``_BUILD_POLL_INTERVAL`` seconds.
+
+    A completed build_and_program job carries ``session_id``: the handle for
+    the board it was flashed onto.
     """
     if timeout is None:
         timeout = DEFAULT_POLL_TIMEOUT
@@ -147,25 +240,42 @@ def poll_job(
     tick = _ANIM_INTERVAL if on_poll else _BUILD_POLL_INTERVAL
     deadline = time.monotonic() + timeout
     next_check = 0.0
-    job = {"status": "queued", "fpga_id": None}
+    failing_since: float | None = None
+    job = {"status": "queued"}
     while time.monotonic() < deadline:
         if time.monotonic() >= next_check:
-            resp = requests.get(url, headers=headers)
+            next_check = time.monotonic() + _BUILD_POLL_INTERVAL
+            try:
+                resp = requests.get(url, headers=headers, timeout=_REQUEST_TIMEOUT)
+                if resp.status_code in _RETRY_STATUSES:
+                    raise requests.ConnectionError(f"HTTP {resp.status_code}")
+            except (requests.ConnectionError, requests.Timeout):
+                # A dropped connection or a restarting server says nothing
+                # about the build, which keeps running server-side. Keep
+                # polling through a short outage instead of abandoning it.
+                now = time.monotonic()
+                failing_since = failing_since or now
+                if now - failing_since > _POLL_OUTAGE_GRACE:
+                    raise
+                if on_poll:
+                    on_poll(job["status"])
+                time.sleep(tick)
+                continue
+            failing_since = None
             resp.raise_for_status()
             job = resp.json()
-            next_check = time.monotonic() + _BUILD_POLL_INTERVAL
             if job["status"] == "complete":
                 if on_poll:
-                    on_poll(job["status"], job["fpga_id"])
+                    on_poll(job["status"])
                 return job
             if job["status"] in ("failed", "cancelled"):
                 logs_resp = requests.get(f"{url}/logs", headers=headers)
-                logs = logs_resp.text if logs_resp.ok else "no logs available"
+                logs = _log_text(logs_resp) if logs_resp.ok else "no logs available"
                 raise RuntimeError(
                     f"Job {job_id!r} ended with status {job['status']!r}.\n{logs}"
                 )
         if on_poll:
-            on_poll(job["status"], job["fpga_id"])
+            on_poll(job["status"])
         time.sleep(tick)
     # Giving up here says nothing about the job: the server keeps building, and
     # this one may still complete. Say so, so a timeout isn't misread as a
@@ -180,9 +290,10 @@ def poll_job(
 
 
 def read(
-    fpga_id: int, api_key: str, address: int, count: int, api_url: str
+    target: Target, api_key: str, address: int, count: int, api_url: str
 ) -> list[int]:
-    url = f"{api_url}/fpga/{fpga_id}/run"
+    """One Wishbone read as a queued run job on your session's board."""
+    url = f"{api_url}{_target_path(target)}/run"
     resp = requests.post(
         url,
         headers={"X-API-Key": api_key, "Content-Type": "application/json"},
@@ -193,14 +304,15 @@ def read(
 
 
 def write(
-    fpga_id: int,
+    target: Target,
     api_key: str,
     address: int,
     words: list[int],
     api_url: str,
     fixed_address: bool = False,
 ) -> None:
-    url = f"{api_url}/fpga/{fpga_id}/run"
+    """One Wishbone write as a queued run job on your session's board."""
+    url = f"{api_url}{_target_path(target)}/run"
     resp = requests.post(
         url,
         headers={"X-API-Key": api_key, "Content-Type": "application/json"},
@@ -216,13 +328,22 @@ def write(
     _poll_run(resp.json()["job_id"], api_key, api_url)
 
 
+def list_sessions(api_key: str, api_url: str) -> list[dict]:
+    """Your live sessions (usually zero or one), newest first."""
+    resp = requests.get(f"{api_url}/sessions", headers={"X-API-Key": api_key})
+    resp.raise_for_status()
+    return resp.json()
+
+
 def list_fpgas(api_key: str, api_url: str) -> list[dict]:
+    """Every board, by id. Admins only (anyone else gets 410)."""
     resp = requests.get(f"{api_url}/fpga", headers={"X-API-Key": api_key})
     resp.raise_for_status()
     return resp.json()
 
 
 def get_fpga(fpga_id: int, api_key: str, api_url: str) -> dict:
+    """One board, by id. Admins only (anyone else gets 410)."""
     resp = requests.get(f"{api_url}/fpga/{fpga_id}", headers={"X-API-Key": api_key})
     resp.raise_for_status()
     return resp.json()
@@ -247,6 +368,34 @@ def set_fpga_online(fpga_id: int, online: bool, api_key: str, api_url: str) -> d
     )
     resp.raise_for_status()
     return resp.json()
+
+
+def resolve_job_id(job_id: str, api_key: str, api_url: str) -> str:
+    """Turn a job id or a unique prefix of one (as ``mrg jobs`` prints) into
+    the full id.
+
+    Raises:
+        ValueError: If no job, or more than one, starts with ``job_id``.
+    """
+    prefix = job_id.strip().rstrip("…").rstrip(".").lower()
+    try:
+        return str(uuid.UUID(prefix))
+    except ValueError:
+        pass
+    if not prefix:
+        raise ValueError("empty job id")
+    matches = [
+        j["job_id"] for j in list_jobs(api_key, api_url)
+        if str(j.get("job_id", "")).lower().startswith(prefix)
+    ]
+    if not matches:
+        raise ValueError(f"no job of yours starts with {job_id!r}")
+    if len(matches) > 1:
+        raise ValueError(
+            f"{len(matches)} of your jobs start with {job_id!r}; "
+            f"use more characters"
+        )
+    return matches[0]
 
 
 def get_job(job_id: str, api_key: str, api_url: str) -> dict:
@@ -282,6 +431,19 @@ def get_logs(job_id: str, api_key: str, api_url: str) -> str:
         headers={"X-API-Key": api_key},
     )
     resp.raise_for_status()
+    return _log_text(resp)
+
+
+def _log_text(resp) -> str:
+    """The log as plain text. The server sends it as a JSON string, which
+    printed raw is one line of escaped ``\\n``s."""
+    if "json" in (getattr(resp, "headers", None) or {}).get("content-type", ""):
+        try:
+            body = resp.json()
+        except ValueError:
+            return resp.text
+        if isinstance(body, str):
+            return body
     return resp.text
 
 
@@ -293,33 +455,89 @@ def cancel_job(job_id: str, api_key: str, api_url: str) -> None:
     resp.raise_for_status()
 
 
-def get_session(fpga_id: int, api_key: str, api_url: str) -> dict:
-    resp = requests.get(
-        f"{api_url}/fpga/{fpga_id}/session",
-        headers={"X-API-Key": api_key},
-    )
+def get_session(target: Target, api_key: str, api_url: str) -> dict:
+    """A live session: its deadlines and the state of its board.
+
+    404 if the session has ended, isn't yours, or doesn't exist.
+    """
+    path = _target_path(target)
+    if isinstance(target, int):
+        path += "/session"
+    resp = requests.get(f"{api_url}{path}", headers={"X-API-Key": api_key})
     resp.raise_for_status()
     return resp.json()
 
 
-def release_session(fpga_id: int, api_key: str, api_url: str) -> str:
+def release_session(target: Target, api_key: str, api_url: str) -> str:
+    """End a session; the board is wiped and freed. Returns the reset job id."""
+    path = _target_path(target)
+    path += "/session/release" if isinstance(target, int) else "/release"
     resp = requests.post(
-        f"{api_url}/fpga/{fpga_id}/session/release",
-        headers={"X-API-Key": api_key},
-        timeout=10.0,
+        f"{api_url}{path}", headers={"X-API-Key": api_key}, timeout=10.0
     )
     resp.raise_for_status()
     return resp.json()["job_id"]
 
 
-def reset_fpga(fpga_id: int, api_key: str, api_url: str) -> dict:
+def reset_session(target: Target, api_key: str, api_url: str) -> dict:
+    """End a session by resetting its board (reflashes the base image)."""
     resp = requests.post(
-        f"{api_url}/fpga/{fpga_id}/reset",
+        f"{api_url}{_target_path(target)}/reset",
         headers={"X-API-Key": api_key},
         timeout=10.0,
     )
     resp.raise_for_status()
     return resp.json()
+
+
+#: The name this had when boards were addressed by id; same function.
+reset_fpga = reset_session
+
+
+class ReclockError(RuntimeError):
+    """A reclock the server refused, or one whose flash failed."""
+
+
+def reclock(target: Target, api_key: str, sys_clk_freq: int, api_url: str) -> dict:
+    """Queue a reflash of a reserved board's build at another user clock (Hz).
+
+    Every build is also packed at each clock its PLL reaches without moving the
+    control plane (VCO / n); the server snaps ``sys_clk_freq`` to the nearest
+    of those within 1%. Returns the server's response, whose ``sys_clk_freq`` is
+    the exact rate that will be flashed.
+
+    Raises:
+        ReclockError: The server refused (409/422) -- its message says why,
+            e.g. listing the rates this build can reach.
+    """
+    resp = requests.post(
+        f"{api_url}{_target_path(target)}/reclock",
+        headers={"X-API-Key": api_key},
+        json={"sys_clk_freq": int(sys_clk_freq)},
+        timeout=10.0,
+    )
+    if resp.status_code in (409, 422):
+        try:
+            message = resp.json()["detail"]["message"]
+        except (ValueError, KeyError, TypeError):
+            message = resp.text
+        raise ReclockError(message)
+    resp.raise_for_status()
+    return resp.json()
+
+
+def wait_job(
+    job_id: str, api_key: str, api_url: str, timeout: float = 600.0
+) -> dict:
+    """Block until a board-side job (reset, reclock) finishes; return its record."""
+    deadline = time.monotonic() + timeout
+    while True:
+        job = get_job(job_id, api_key, api_url)
+        if job["status"] in ("complete", "failed", "cancelled"):
+            return job
+        if time.monotonic() > deadline:
+            raise TimeoutError(f"job {job_id!r} did not finish in {timeout:.0f}s")
+        time.sleep(_BUILD_POLL_INTERVAL)
 
 
 def _poll_run(job_id: str, api_key: str, api_url: str) -> list[int]:
@@ -343,7 +561,7 @@ def _poll_run(job_id: str, api_key: str, api_url: str) -> list[int]:
     raise TimeoutError(f"Run job {job_id!r} did not complete in time")
 
 
-def _ws_url(api_url: str, fpga_id: int) -> str:
+def _ws_url(api_url: str, target: Target) -> str:
     """Convert the orchestrator's http(s):// API URL to its /stream ws(s):// form."""
     if api_url.startswith("https://"):
         base = "wss://" + api_url[len("https://") :]
@@ -351,7 +569,7 @@ def _ws_url(api_url: str, fpga_id: int) -> str:
         base = "ws://" + api_url[len("http://") :]
     else:
         base = api_url
-    return f"{base}/fpga/{fpga_id}/stream"
+    return f"{base}{_target_path(target)}/stream"
 
 
 def get_health(api_url: str) -> dict:

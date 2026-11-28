@@ -129,6 +129,7 @@ class _Server:
     def __init__(self):
         self.requests: list[bytes] = []
         self.paths: list[str] = []
+        self.sockets: list = []
         self.headers: list = []
         self.replies: list = []
         self.reject_status: int | None = None
@@ -152,6 +153,7 @@ class _Server:
 
     def _handle(self, ws) -> None:
         self.paths.append(ws.request.path)
+        self.sockets.append(ws)
         # Headers is case-insensitive; keep the object itself rather than a
         # plain dict so lookups like headers["X-API-Key"] still work.
         self.headers.append(ws.request.headers)
@@ -197,8 +199,8 @@ def transports():
     """Make WebSocketTransports that are always closed after the test."""
     made = []
 
-    def make(server: _Server, fpga_id: int = 0) -> _transport.WebSocketTransport:
-        t = _transport.WebSocketTransport(fpga_id, "k", server.http_url)
+    def make(server: _Server, target="sess-0") -> _transport.WebSocketTransport:
+        t = _transport.WebSocketTransport(target, "k", server.http_url)
         made.append(t)
         return t
 
@@ -220,9 +222,10 @@ def _wait_until(predicate, timeout: float = 2.0) -> bool:
 
 
 def test_ws_url_conversion():
-    assert _ws_url("https://api.manhattanreasoning.com", 3) == (
-        "wss://api.manhattanreasoning.com/fpga/3/stream"
+    assert _ws_url("https://api.manhattanreasoning.com", "abc") == (
+        "wss://api.manhattanreasoning.com/sessions/abc/stream"
     )
+    # Admins may still name a board by number.
     assert _ws_url("http://127.0.0.1:9000", 0) == "ws://127.0.0.1:9000/fpga/0/stream"
 
 
@@ -246,9 +249,9 @@ def test_nothing_connects_before_the_first_call(server, transports):
     assert t._conn is None
 
 
-def test_write_sends_correct_frame_to_the_right_fpga(server, transports):
-    transports(server, fpga_id=5).write(0x10, [0xDEADBEEF])
-    assert server.paths == ["/fpga/5/stream"]
+def test_write_sends_correct_frame_to_the_right_session(server, transports):
+    transports(server, "sess-5").write(0x10, [0xDEADBEEF])
+    assert server.paths == ["/sessions/sess-5/stream"]
     assert server.headers[0]["X-API-Key"] == "k"
     # opcode=WRITE(1), length=1, address=0x10, data=[0xDEADBEEF]
     assert server.requests == [
@@ -329,10 +332,9 @@ def test_long_lived_socket_raises_no_deprecation_warning(server, transports):
 def test_rejected_handshake_names_the_status_and_the_fixes(server, transports):
     server.reject_status = 403
     with pytest.raises(ConnectionError) as info:
-        transports(server, fpga_id=3).write(0x0, [1])
+        transports(server).write(0x0, [1])
     msg = str(info.value)
-    assert "Couldn't open a WebSocket to FPGA 3 (HTTP 403)" in msg
-    assert "mrg status 3" in msg
+    assert "Couldn't open a WebSocket to your board (HTTP 403)" in msg
     assert 'transport="http"' in msg
     assert "MRG_TRANSPORT=http" in msg
     assert server.requests == []
@@ -346,11 +348,11 @@ def test_network_failure_on_open_names_the_fix(monkeypatch, error):
         raise error
 
     monkeypatch.setattr(_transport.websockets.sync.client, "connect", fail)
-    t = _transport.WebSocketTransport(3, "k", "https://api.example")
+    t = _transport.WebSocketTransport("sess-3", "k", "https://api.example")
     with pytest.raises(ConnectionError) as info:
         t.read(0x0)
     msg = str(info.value)
-    assert "Couldn't open a WebSocket to FPGA 3" in msg
+    assert "Couldn't open a WebSocket to your board" in msg
     assert str(error) in msg
     assert "MRG_TRANSPORT=http" in msg
     assert info.value.__cause__ is error
@@ -359,9 +361,9 @@ def test_network_failure_on_open_names_the_fix(monkeypatch, error):
 def test_busy_board_is_reported_as_in_use(server, transports):
     server.close_with = (4409, "FPGA is busy with a run job")
     with pytest.raises(ConnectionError) as info:
-        transports(server, fpga_id=3).write(0x0, [1])
+        transports(server).write(0x0, [1])
     msg = str(info.value)
-    assert "FPGA 3 is in use by another connection" in msg
+    assert "Your board is in use by another connection" in msg
     assert "FPGA is busy with a run job" in msg
 
 
@@ -370,11 +372,11 @@ def test_busy_board_is_reported_as_in_use(server, transports):
 )
 def test_drop_during_a_call_says_it_may_have_run(server, transports, code, reason):
     server.close_with = (code, reason)
-    t = transports(server, fpga_id=3)
+    t = transports(server)
     with pytest.raises(ConnectionError) as info:
         t.write(0x10, [1])
     msg = str(info.value)
-    assert "Connection to FPGA 3 lost during write to 0x10" in msg
+    assert "Connection to your board lost during write to 0x10" in msg
     assert f"server closed with {code}: {reason}" in msg
     assert "may or may not have run" in msg
     assert t._conn is None
@@ -382,9 +384,9 @@ def test_drop_during_a_call_says_it_may_have_run(server, transports, code, reaso
 
 def test_drop_without_a_close_frame_says_it_may_have_run():
     exc = _transport.websockets.exceptions.ConnectionClosed(None, None)
-    err = _transport._closed_error(exc, 3, "read of 1 words at 0x8")
+    err = _transport._closed_error(exc, "sess-3", "read of 1 words at 0x8")
     assert str(err) == (
-        "Connection to FPGA 3 lost during read of 1 words at 0x8. "
+        "Connection to your board lost during read of 1 words at 0x8. "
         "The operation may or may not have run on the FPGA."
     )
 
@@ -419,54 +421,46 @@ def test_text_frame_reply_raises(server, transports):
         transports(server).read(0x0)
 
 
-# -- WebSocketTransport: idle close and threads ---------------------------------
+# -- WebSocketTransport: open streams and threads ------------------------------
 
 
-@pytest.fixture
-def short_idle(monkeypatch):
-    monkeypatch.setattr(_transport, "_WS_IDLE_TIMEOUT", 0.2)
+def test_socket_is_not_closed_when_idle(server, transports, monkeypatch):
+    # The old idle watcher honoured this; it must have no effect now.
+    monkeypatch.setattr(_transport, "_WS_IDLE_TIMEOUT", 0.2, raising=False)
+    t = transports(server)
+    t.read(0x0)
+    time.sleep(0.5)
+    assert t._conn is not None  # no idle close any more
+    assert server.ended == 0
 
 
-def test_idle_socket_closes_itself_and_reopens_on_next_call(
-    server, transports, short_idle
-):
+def test_session_ended_close_is_explained(server, transports):
+    server.close_with = (4410, "Session ended: idle timeout.")
+    with pytest.raises(
+        ConnectionError, match="Your session has ended.*idle timeout"
+    ):
+        transports(server).read(0x0)
+
+
+def test_board_busy_close_is_explained(server, transports):
+    server.close_with = (4503, "board busy: still in use after 20s")
+    with pytest.raises(ConnectionError, match="Your board is busy"):
+        transports(server).read(0x0)
+
+
+def test_session_ended_while_idle_is_not_reconnected(server, transports):
     t = transports(server)
     t.write(0x0, [1])
-    assert _wait_until(lambda: server.ended == 1)  # closed by the idle timer
+    # The server ends the session while the socket sits idle.
+    for ws in list(server.sockets):
+        ws.close(4410, "Session ended: released.")
+    assert _wait_until(lambda: server.ended == 1)
+    with pytest.raises(
+        ConnectionError, match="Your session has ended.*released"
+    ):
+        t.write(0x0, [2])
+    assert len(server.paths) == 1  # did not reconnect
     assert t._conn is None
-    t.write(0x0, [2])
-    assert len(server.paths) == 2
-
-
-def test_calls_keep_pushing_the_idle_deadline_out(server, transports, short_idle):
-    t = transports(server)
-    for i in range(10):  # 0.5 s of activity, never 0.2 s idle
-        t.write(0x0, [i])
-        time.sleep(0.05)
-    assert len(server.paths) == 1
-    assert server.ended == 0
-
-
-def test_idle_timer_never_closes_during_a_slow_call(server, transports, short_idle):
-    server.delay = 0.5  # the reply takes longer than the idle timeout
-    t = transports(server)
-    assert t.read(0x8) == [0x8]
-    assert server.ended == 0
-
-
-def test_close_stops_the_idle_watcher(server, transports):
-    t = transports(server)
-    t.write(0x0, [1])
-    watcher = t._watcher
-    assert watcher.is_alive()
-    t.close()
-    assert not watcher.is_alive()
-
-
-def test_idle_watcher_does_not_keep_the_process_alive(server, transports):
-    t = transports(server)
-    t.write(0x0, [1])
-    assert t._watcher.daemon
 
 
 def test_threads_sharing_a_transport_get_their_own_replies(server, transports):
@@ -496,9 +490,9 @@ def _make_app(monkeypatch, tmp_path, *, api_url, **kwargs):
     monkeypatch.delenv("MRG_API_KEY", raising=False)
     monkeypatch.delenv("MRG_TRANSPORT", raising=False)
     app = mrg.App(
-        "x", design="d.py", fpga_id=7, api_key="k", api_url=api_url, **kwargs
-    )
-    app._programmed = True  # skip the real build/program flow
+        "x", design="d.py", session="sess-7", api_key="k", api_url=api_url,
+        **kwargs,
+    )  # a session given up front: no build/program flow
     return app
 
 
@@ -522,7 +516,7 @@ def test_app_uses_a_websocket_by_default(
         app.write(0x4, [2, 3])
         assert app.read(0x8) == 0x8  # one word comes back as an int
         assert app.read(0x8, count=2) == [0x8, 0xC]
-    assert server.paths == ["/fpga/7/stream"]  # one socket for all four calls
+    assert server.paths == ["/sessions/sess-7/stream"]  # one socket, four calls
     assert len(server.requests) == 4
 
 
@@ -544,9 +538,10 @@ def test_app_http_transport_never_opens_a_socket(monkeypatch, tmp_path):
     )
     assert app.read(0x8) == 42
     app.write(0x10, 5, fixed_address=True)
-    assert calls[0] == ("read", (7, "k", 0x8, 1, "https://api.example"))
+    assert calls[0] == ("read", ("sess-7", "k", 0x8, 1, "https://api.example"))
     assert calls[1] == (
-        "write", (7, "k", 0x10, [5], "https://api.example"), {"fixed_address": True}
+        "write", ("sess-7", "k", 0x10, [5], "https://api.example"),
+        {"fixed_address": True},
     )
 
 
@@ -605,10 +600,10 @@ def test_app_reused_after_release_talks_to_the_new_board(
     with app:
         app.write(0x0, 1)
     # A second `with app:` reprograms first and may land on another board.
-    app._programmed, app.fpga_id = True, 8
+    app._programmed, app.session_id = True, "sess-8"
     with app:
         app.write(0x0, 2)
-    assert server.paths == ["/fpga/7/stream", "/fpga/8/stream"]
+    assert server.paths == ["/sessions/sess-7/stream", "/sessions/sess-8/stream"]
 
 
 def test_stream_is_gone_from_the_public_api():

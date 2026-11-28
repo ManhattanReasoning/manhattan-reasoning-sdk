@@ -11,12 +11,14 @@ from __future__ import annotations
 import os
 
 from ._app import App, RegisterMap
-from ._client import get_session, release_session
+from ._client import ReclockError, get_session, list_sessions, release_session
 
 __all__ = [
     "App",
+    "ReclockError",
     "RegisterMap",
     "get_session",
+    "list_sessions",
     "release_session",
     "secret",
 ]
@@ -33,7 +35,6 @@ def secret(env_var: str) -> str:
         app = manhattan_reasoning_gym.cloud.App(
             "my_design",
             design="design.py",
-            fpga_id=0,
             api_key=manhattan_reasoning_gym.cloud.secret("MRG_API_KEY"),
         )
     """

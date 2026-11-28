@@ -12,7 +12,7 @@ def isolated_config(tmp_path, monkeypatch):
 
 
 def _app(**kw):
-    return manhattan_reasoning_gym.App("x", design="d.py", fpga_id=0, **kw)
+    return manhattan_reasoning_gym.App("x", design="d.py", **kw)
 
 
 def test_explicit_arg_wins():

@@ -1,9 +1,14 @@
 from __future__ import annotations
 
 import os
+import shlex
 import signal
+import sys
+import tempfile
 import threading
+import warnings
 from collections.abc import Callable
+from pathlib import Path
 
 import requests
 
@@ -12,6 +17,105 @@ from . import _client, _credentials, _progress, _transport
 # All App instances created at module import time are registered here so the
 # CLI can discover them without the user needing to export anything explicitly.
 _registry: list[App] = []
+
+
+#: The longest command line sent; the server keeps at most this much.
+_MAX_COMMAND = 1000
+#: A flag or ``NAME=value`` whose name contains one of these has its value
+#: hidden: ``--api-key``, ``--token``, ``--db-password``, ``SECRET=...``.
+_SECRET_WORDS = ("key", "token", "secret", "passw")
+
+
+def _is_api_key_flag(name: str) -> bool:
+    """``--api-key`` or a shortened form of it, which argparse also accepts."""
+    return len(name) >= len("--api") and "--api-key".startswith(name)
+
+
+def _is_secret_name(name: str) -> bool:
+    lowered = name.lower()
+    return _is_api_key_flag(name) or any(w in lowered for w in _SECRET_WORDS)
+
+
+def _redact(args: list[str]) -> list[str]:
+    """``args`` with the value of every secret-looking flag replaced by ``***``."""
+    out: list[str] = []
+    hide_next = False
+    for arg in args:
+        # A word starting with "-" is the next flag, not the secret's value.
+        if hide_next and not arg.startswith("-"):
+            out.append("***")
+            hide_next = False
+            continue
+        hide_next = False
+        name, eq, _ = arg.partition("=")
+        if eq and _is_secret_name(name):
+            out.append(f"{name}=***")
+        elif arg.startswith("-") and _is_secret_name(arg):
+            out.append(arg)
+            hide_next = True
+        else:
+            out.append(arg)
+    return out
+
+
+def _join(words: list[str]) -> str:
+    """Shell-quote ``words``, dropping whole words at the end (marked ``...``)
+    rather than cutting a quoted one in half."""
+    line = ""
+    for word in words:
+        quoted = shlex.quote(word)
+        longer = f"{line} {quoted}" if line else quoted
+        if len(longer) > _MAX_COMMAND - len(" ..."):
+            return f"{line} ..." if line else quoted[:_MAX_COMMAND]
+        line = longer
+    return line
+
+
+def _main_module() -> str | None:
+    """``pkg.mod`` when this program was started as ``python -m pkg.mod``."""
+    spec = getattr(sys.modules.get("__main__"), "__spec__", None)
+    return getattr(spec, "name", None)
+
+
+def _command_line(argv: list[str] | None = None, module: str | None = None) -> str:
+    """How this program was started, for the dashboard: ``mrg run sat.py``,
+    ``python sat.py --n 64`` or ``python -m pkg.mod``.
+
+    Secret-looking values are replaced by ``***`` (``_redact``). A notebook
+    sends only ``jupyter``, because the kernel's arguments are a local file
+    path, and ``python -c`` sends no code. ``module`` is the ``-m`` module;
+    with no ``argv`` both are read from this process.
+    """
+    if argv is None:
+        argv, module = sys.argv, _main_module()
+    args = list(argv)
+    if not args or not args[0]:
+        return "python"
+    # Split on both separators: a Windows path must work when tests run on Linux.
+    prog = args[0].replace("\\", "/").rsplit("/", 1)[-1]
+    if prog.lower().endswith(".exe"):
+        prog = prog[:-4]
+    if module == "ipykernel_launcher" or prog.startswith("ipykernel_launcher"):
+        return "jupyter"
+    if prog == "-c":
+        return "python -c"
+    if module and module != "__main__":
+        head = ["python", "-m", module.removesuffix(".__main__")]
+    elif prog.endswith(".py"):
+        head = ["python", prog]
+    else:
+        head = [prog]
+    return _join(head + _redact(args[1:]))
+
+
+def _warn_fpga_id() -> None:
+    warnings.warn(
+        "fpga_id is no longer used: the server picks the board, and you reach "
+        "it through your session (App.session_id). To reconnect to a session "
+        "you hold, pass App(session=...) or run `mrg run --no-program`.",
+        FutureWarning,
+        stacklevel=3,
+    )
 
 
 class RegisterMap:
@@ -33,15 +137,15 @@ class App:
     ``$MRG_API_KEY`` > the key stored by ``mrg login``), so it
     usually doesn't need to be passed explicitly.
 
-    ``fpga_id`` is optional and normally left unset -- a fresh build never
-    picks a board itself, the server assigns whichever one frees up first once
-    the build finishes, and this fills in automatically once ``_program()``
-    completes. Pass it explicitly only to reconnect to a board you already
-    have a live session on without rebuilding (``mrg run --no-program
-    --fpga-id N`` / ``App(..., fpga_id=N)`` with programming skipped).
+    You never pick a board: the server assigns one once the build finishes,
+    and ``session_id`` -- your handle for that reservation -- fills in when
+    ``_program()`` completes. Pass ``session=`` to reconnect to a session you
+    already hold without rebuilding (``mrg run --no-program`` finds it for
+    you; ``mrg status`` lists your sessions). ``fpga_id=`` is no longer used.
 
     ``read()``/``write()`` go over one WebSocket, opened on the first call and
-    closed after a short idle period (the next call reopens it). Pass
+    kept open for the whole session (the server closes it when the session
+    ends; the next call after that raises a clear error). Pass
     ``transport="http"`` -- or set ``$MRG_TRANSPORT=http`` -- to make each call
     its own HTTP job instead: much slower, but it works on networks that block
     WebSockets.
@@ -71,6 +175,7 @@ class App:
         sources: list[str] | None = None,
         include_dir: str | None = None,
         top: str | None = None,
+        session: str | None = None,
         fpga_id: int | None = None,
         registers: type[RegisterMap] | None = None,
         api_key: str | None = None,
@@ -79,8 +184,13 @@ class App:
         timing_target_mhz: float | None = None,
         poll_timeout: float | None = None,
         transport: str | None = None,
+        local: bool = False,
     ) -> None:
         self.name = name
+        # Build the bitstream on this machine instead of the build server
+        # (`mrg run --local`): reserve a slot, build in the pinned image,
+        # upload, then the server flashes it exactly like a cloud build.
+        self.local = local
         self.design = design
         self.sources = None if sources is None else list(sources)
         self.include_dir = include_dir
@@ -98,7 +208,11 @@ class App:
         # design); only needed when the file has more than one module
         # exposing the Wishbone contract -- otherwise auto-detected.
         self.top = top
-        self.fpga_id = fpga_id
+        if fpga_id is not None:
+            _warn_fpga_id()
+        # The session this App drives: set by _program(), or given to reconnect
+        # to one you already hold (then there is nothing to program).
+        self.session_id: str | None = session
         self.registers = registers
         self.api_url = api_url
         # Optional override for the SoC compute-domain clock (Hz). None lets the
@@ -119,7 +233,7 @@ class App:
             api_key or os.environ.get("MRG_API_KEY") or _credentials.load(api_url) or ""
         )
         self._entrypoint: Callable | None = None
-        self._programmed = False
+        self._programmed = session is not None
         self._connection: _transport.Transport | None = None
         _registry.append(self)
 
@@ -163,14 +277,25 @@ class App:
         words = [value] if isinstance(value, int) else value
         self._open_connection().write(addr, words, fixed_address=fixed_address)
 
+    @property
+    def fpga_id(self) -> None:
+        """Removed: boards aren't addressed by id any more. Use ``session_id``."""
+        _warn_fpga_id()
+        return None
+
+    @fpga_id.setter
+    def fpga_id(self, _value: int | None) -> None:
+        _warn_fpga_id()
+
     def _program(self) -> None:
         """Submit the design and block until it's built and flashed.
 
-        No board is chosen up front: the server assigns one once the build
-        finishes and some board's worker is ready to flash it. ``self.fpga_id``
-        is set from the completed job, not decided here -- it's discovered,
-        not picked.
+        No board is chosen: the server assigns one once the build finishes.
+        ``self.session_id`` is set from the completed job.
         """
+        if self.local:
+            self._program_local()
+            return
         job_id = _client.submit(
             self.design,
             self.api_key,
@@ -178,12 +303,73 @@ class App:
             top=self.top,
             sys_clk_freq=self.sys_clk_freq,
             timing_target_mhz=self.timing_target_mhz,
+            command=_command_line(),
+            project=self.name,
             **({"sources": self.sources} if self.sources is not None else {}),
             **(
                 {"include_dir": self.include_dir}
                 if self.include_dir is not None else {}
             ),
         )
+        self._wait_for_board(job_id)
+
+    def _program_local(self) -> None:
+        """Build the bitstream here, upload it, and block until it's flashed.
+
+        The server reserves a build slot first (its MAC/IP must be baked into
+        the bitstream), the build runs in the pinned image on this machine,
+        and the upload hands the job to the same flash queue a cloud build
+        uses. Any failure before the flash finishes cancels the reservation so
+        the slot goes straight back to the pool.
+        """
+        if self.sources is not None or self.include_dir is not None:
+            raise ValueError(
+                "mrg run --local builds a single design file; "
+                "sources/include_dir are not supported yet"
+            )
+        from . import _local_bitstream
+
+        res = _client.reserve_local_build(self.api_key, self.api_url)
+        job_id = res["job_id"]
+        try:
+            out_dir = Path(tempfile.mkdtemp(prefix=f"mrg-local-{job_id[:8]}-"))
+            print(
+                f"[{self.name}] reserved build slot {res['slot_id']} "
+                f"(IP {res['ip']}); building locally, upload due by "
+                f"{res['expires_at']}. Output: {out_dir}",
+                flush=True,
+            )
+            built = _local_bitstream.build_bitstream(
+                self.design,
+                slot_id=res["slot_id"],
+                out_dir=out_dir,
+                sys_clk_freq=self.sys_clk_freq,
+                timing_target_mhz=self.timing_target_mhz,
+                top=self.top,
+            )
+            try:
+                _client.upload_bitstream(
+                    job_id, built.path, built.manifest, self.api_key, self.api_url
+                )
+            except _client.LocalBuildAPIError as exc:
+                if exc.code == "reservation_expired":
+                    raise _client.LocalBuildAPIError(
+                        exc.status,
+                        exc.code,
+                        "the build finished after the reservation expired; "
+                        "run `mrg run --local` again to reserve a new slot",
+                    ) from exc
+                raise
+        except BaseException:
+            try:
+                _client.cancel_job(job_id, self.api_key, self.api_url)
+            except Exception:
+                pass
+            raise
+        self._wait_for_board(job_id)
+
+    def _wait_for_board(self, job_id: str) -> None:
+        """Block until ``job_id`` is flashed onto a board; keep its session."""
         bar = _progress.BuildProgress(self.name)
         try:
             job = _client.poll_job(
@@ -200,9 +386,67 @@ class App:
             except Exception:
                 pass
             raise
-        self.fpga_id = job["fpga_id"]
-        bar.finish(self.fpga_id)
+        session_id = job.get("session_id")
+        if not session_id:
+            raise RuntimeError(
+                f"Job {job_id!r} completed but the server sent no session id. "
+                "It may be older than this SDK; see `mrg job "
+                f"{job_id}`."
+            )
+        self.session_id = session_id
+        bar.finish()
         self._programmed = True
+
+    def reclock(self, sys_clk_freq: float) -> int:
+        """Switch the design to another clock without rebuilding it.
+
+        Reflashes this board with the same build re-packed at ``sys_clk_freq``
+        (Hz): identical placement and routing, only the user-clock PLL divider
+        differs, so a sweep over clocks is a true overclock test at a few
+        seconds per point. Reachable rates are VCO / n (e.g. 600 MHz / n: 50,
+        60, 75, 85.7, 100, 120, 150, ...); anything within 1% of one snaps to it.
+
+        The board, session, and network identity carry over, but reflashing
+        resets the design -- re-write any registers you had set. This App's
+        WebSocket is closed first (an open socket holds the board's link lock,
+        which the reflash needs); the next ``read()``/``write()`` reopens it.
+
+        Returns:
+            The exact clock flashed, in Hz (also stored as ``self.sys_clk_freq``).
+
+        Raises:
+            ReclockError: The server refused the rate (the message lists the
+                ones this build can reach), or the flash failed. A failed flash
+                usually means the design didn't come up at that clock; the
+                server then recovers the board and ends the session.
+        """
+        if not self._programmed or self.session_id is None:
+            raise _client.ReclockError("no board programmed yet; nothing to reclock")
+        self._close_connection()
+        queued = _client.reclock(
+            self.session_id, self.api_key, int(sys_clk_freq), self.api_url
+        )
+        job = _client.wait_job(queued["job_id"], self.api_key, self.api_url)
+        if job["status"] != "complete":
+            try:
+                state = _client.get_session(
+                    self.session_id, self.api_key, self.api_url
+                ).get("state")
+            except requests.HTTPError as exc:
+                # 404: the session is over (the failed flash ended it and the
+                # board went back to be wiped).
+                if exc.response is None or exc.response.status_code != 404:
+                    raise
+                state = "ended"
+            self._programmed = state == "reserved"
+            where = "still yours" if self._programmed else "your session has ended"
+            raise _client.ReclockError(
+                f"reclock to {queued['sys_clk_freq'] / 1e6:g} MHz "
+                f"{job['status']} ({where}); "
+                f"see `mrg logs {queued['job_id']}`"
+            )
+        self.sys_clk_freq = queued["sys_clk_freq"]
+        return self.sys_clk_freq
 
     def release(self) -> str:
         """Release the active session, returning the reset job_id.
@@ -210,7 +454,7 @@ class App:
         Closes this App's WebSocket first: an open socket holds the board's
         link lock, which the reset job needs.
         """
-        if self.fpga_id is None:
+        if self.session_id is None:
             return ""
 
         self._close_connection()
@@ -227,16 +471,14 @@ class App:
                     orig_handler = None
             try:
                 job_id = _client.release_session(
-                    self.fpga_id, self.api_key, self.api_url
+                    self.session_id, self.api_key, self.api_url
                 )
             except requests.HTTPError as exc:
-                if exc.response is not None and exc.response.status_code == 404:
-                    # Session key expired or missing in Redis while the board is still
-                    # reserved; fall back to direct reset to return the FPGA to idle.
-                    res = _client.reset_fpga(self.fpga_id, self.api_key, self.api_url)
-                    job_id = res.get("job_id", "")
-                else:
+                if exc.response is None or exc.response.status_code != 404:
                     raise
+                # 404: the session already ended (timeout, reset); the server
+                # is already wiping the board, so there is nothing to release.
+                job_id = ""
             self._programmed = False
             return job_id
         finally:
@@ -259,11 +501,11 @@ class App:
             self._program()
 
     def _open_connection(self) -> _transport.Transport:
-        # Made on first use, not in __init__: fpga_id is only known once the
-        # board has been programmed.
+        # Made on first use, not in __init__: the session is only known once
+        # the board has been programmed.
         if self._connection is None:
             self._connection = _transport.open_transport(
-                self.transport, self.fpga_id, self.api_key, self.api_url
+                self.transport, self.session_id, self.api_key, self.api_url
             )
         return self._connection
 

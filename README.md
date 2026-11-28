@@ -42,14 +42,14 @@ export MRG_API_KEY=...        # or: mrg login --github-token <no-scope PAT>
 mrg synth examples/design.py  # JSON report on stdout, ~seconds
 mrg pnr   examples/design.py  # JSON report (fmax_mhz, timing_met), ~tens of seconds
 mrg run   examples/app.py     # programs a real FPGA, ~2-3 min first time
-mrg reset 0                   # free the board when done (async, ~1 min)
+mrg reset                     # free the board when done (async, ~1 min)
 ```
 
 - **All bus addresses are byte addresses**: word *n* in your design's register
   map is byte address `4*n` for `app.read`/`app.write` and `mrg read`/`mrg write`.
 - **After `mrg run` the board stays reserved to you** — reuse it with
   `mrg run --no-program` / `mrg read` / `mrg write`, and release it with
-  `mrg reset <fpga_id>` when done. Reset is an async queued job that reflashes
+  `mrg reset` when done. Reset is an async queued job that reflashes
   the base SoC (~1 min); poll `mrg status --json` rather than expecting
   instant `idle`.
 - `mrg synth` / `mrg pnr` print machine-readable JSON on stdout and exit
@@ -114,8 +114,8 @@ with app:                    # programs the FPGA on first use, releases on exit
 ```
 
 `read`/`write` calls go over one WebSocket that the SDK opens on the first
-call, reuses for every call after it, and closes after 25 s without a call
-(the next call reopens it). On a network that blocks WebSockets, use HTTP
+call and reuses for every call after it. It stays open for the whole session;
+the server closes it when the session ends. On a network that blocks WebSockets, use HTTP
 instead: `App(..., transport="http")`, `MRG_TRANSPORT=http`, or
 `--transport http` on `mrg run` / `mrg read` / `mrg write`. HTTP works
 anywhere but is much slower: each call is a queued job (about 0.5 s or more).
@@ -130,11 +130,69 @@ mrg run examples/app.py
 
 Name your registers by subclassing `mrg.RegisterMap` (byte addresses).
 
+**Clock sweeps without rebuilding:** `app.reclock(hz)` reflashes the board with
+the same build at another user clock, in seconds instead of a full build. The
+placement and routing are identical at every point, so a sweep is a true
+overclock test. Reachable rates are VCO / n between 20 and 200 MHz (with the
+usual 600 MHz VCO: 50, 60, 75, 100, 120, 150, ...); a request within 1% of one
+snaps to it, and the call returns the exact rate flashed. Anything else raises
+`mrg.cloud.ReclockError` listing the rates the build can reach. Reflashing resets the
+design, so re-write any registers you had set. A rate too fast for the design
+to boot ends the session.
+
+```python
+for hz in (50e6, 75e6, 100e6, 120e6, 150e6):
+    app.reclock(hz)
+    app.write(0x0, 3)
+    print(hz, app.read(0x8))
+```
+
 **Board lifecycle:** the `with app:` form releases the board on exit, but
 `mrg run` does **not** — the reservation persists so you can keep iterating
 with `mrg run --no-program`, `mrg read`, and `mrg write`. Free the board with
-`mrg reset <fpga_id>` (an async job that reflashes the base SoC, ~1 min — poll
+`mrg reset` (an async job that reflashes the base SoC, ~1 min — poll
 `mrg status`).
+
+**Sessions, not boards:** you never pick a board or see which one you got.
+Each reservation is a *session* with a random id (`mrg status` shows its first
+8 characters, `app.session_id` the whole thing). `mrg run --no-program`,
+`mrg read`, `mrg write` and `mrg reset` act on the session you hold; if you
+hold more than one, choose with `--session ID` (the 8-character prefix is
+enough). A session's id stops working the moment it ends, and the next build
+gets a new one.
+
+### Build locally, run in the cloud: `mrg run --local`
+
+`mrg run --local` builds the bitstream on your machine and uses the cloud only
+to flash and run it. It is useful when the server build queue is busy or you
+want the build log on your disk.
+
+```bash
+# one-time: build the pinned build image from the Manhattan-Reasoning-Cloud repo
+docker build --platform linux/amd64 -f infra/fargate/Dockerfile -t mrg-local-build:latest .
+
+mrg run --local examples/app.py
+mrg run --local examples/app.py --sys-clk 75e6 --timing-target-mhz 80
+```
+
+What it does:
+
+1. Reserves a build slot (`POST /builds/local`) and gets back a `job_id`, the
+   slot's IP, and an upload deadline (30 min by default).
+2. Builds the design for that slot in Docker (`--network=none`). Output goes to
+   a temp folder `mrg-local-<first 8 chars of job_id>-*` holding `design.bit`, `manifest.json`
+   (sha256, image digest, git revision), and `build.log`; the path is printed.
+3. Uploads the bitstream and manifest (`PUT /jobs/{job_id}/bitstream`). The
+   server answers `queued`, flashes a board, and the job ends `complete`.
+4. Waits for the board, then runs your `@app.local_entrypoint()` as usual.
+
+In Python, use `mrg.cloud.App(..., local=True)`. Notes:
+
+- Needs Docker. Set `$MRG_LOCAL_BUILD_IMAGE` to use another image tag or digest.
+- One local build in flight per user; a second reserve gets `402 build_in_flight`.
+- Single design file only (`--include-dir` / `--source` are not supported yet).
+- If the build runs past the deadline, the upload gets `410`; run
+  `mrg run --local` again to reserve a new slot.
 
 ## Authentication (cloud only)
 
@@ -173,21 +231,25 @@ mrg login | logout
 mrg synth <design.py>                       # local synthesis report
 mrg pnr   <design.py> [--sys-clk-mhz N] [--timing-target-mhz N] [--target-mhz N]
                                             # local full-SoC place & route
-mrg run   <file.py> [--no-program [--fpga-id N]]   # --fpga-id only meaningful with --no-program:
-                                                     # a fresh build is never pinned to a board
-mrg status [fpga_id] [--json]
+mrg run   <file.py> [--no-program] [--session ID]  # reconnect to your session, no rebuild
+mrg run   <file.py> --local                  # build on this machine (Docker), upload, then run
+mrg status [SESSION] [--json]
 mrg jobs [--status queued|running|complete|failed|cancelled]
          [--type build|run|reset|all] [-n N | --all] [--json]
                                             # default: your 10 most recent builds
 mrg job <job_id> [--json]
 mrg logs | cancel <job_id>
-mrg reset <fpga_id>
-mrg read  <fpga_id> <addr> [--count N]
-mrg write <fpga_id> <addr> <value>
+mrg reset [SESSION]
+mrg read  <addr> [--count N] [--session ID]
+mrg write <addr> <value> [--session ID]
 mrg admin [online|offline <fpga_id>...] [--json]
                                             # admins only: physical stack view,
                                             # take boards in/out of rotation
 ```
+
+`mrg status` lists the sessions you hold (it needs you signed in: `mrg login`).
+With none it says so; `mrg status --json` then prints `[]`. A session id that
+has ended, or isn't yours, gets the same "no such session" answer either way.
 
 Human-readable `mrg status` output includes the server commit from `/health`.
 A package built with local changes is marked `modified source`. Older servers
@@ -266,6 +328,20 @@ or an explicit list if necessary. A design without local dependencies keeps
 the single-file upload format. This requires the matching cloud API/build-image
 update; local `mrg synth`/`mrg pnr` remain single-file commands.
 See [the example](examples/multi_file/README.md).
+
+### What the dashboard shows about a build
+
+Each cloud build also sends the command that started it (for example
+`mrg run sat.py --top t`) and the app's name, so the web dashboard can show
+them with the build. You and the Manhattan Reasoning admins can see them.
+
+- The value of any option whose name contains `key`, `token`, `secret` or
+  `password` (as `--name value`, `--name=value` or `NAME=value`) is replaced
+  by `***`.
+- A notebook sends only `jupyter`, and `python -c` sends no code.
+
+Other values are sent as typed, so pass any other secret in an environment
+variable, not on the command line.
 
 ### Status durations
 

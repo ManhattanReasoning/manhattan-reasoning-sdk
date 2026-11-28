@@ -23,6 +23,7 @@ _RED    = "\033[31m"
 _GREEN  = "\033[32m"
 _YELLOW = "\033[33m"
 _CYAN   = "\033[36m"
+_MAGENTA = "\033[35m"
 _DIM    = "\033[2m"
 
 _USE_COLOR = sys.stdout.isatty()
@@ -39,6 +40,7 @@ _STATE_COLOR = {
     "programming":  _YELLOW,
     "reserved":     _CYAN,
     "error":        _RED,
+    "dirty":        _MAGENTA,
 }
 
 _JOB_COLOR = {
@@ -65,9 +67,10 @@ def _fmt_id(s: str | None) -> str:
     return _c(s[:8] + "…", _DIM)
 
 
-def _fmt_fpga(fpga_id: int | None) -> str:
-    # None means no board assigned yet -- still building, or waiting to flash.
-    return str(fpga_id) if fpga_id is not None else _c("-", _DIM)
+def _short(session_id: str | None) -> str:
+    """The first 8 characters of a session id -- enough to tell yours apart,
+    and accepted anywhere a session id is."""
+    return session_id[:8] if session_id else "-"
 
 
 # ── helpers ──────────────────────────────────────────────────────────────────
@@ -92,10 +95,11 @@ def _creds(args: argparse.Namespace) -> tuple[str, str]:
 def _creds_optional(args: argparse.Namespace) -> tuple[str, str]:
     """Same resolution as _creds, but never exits.
 
-    Board status, job status, and logs are public read endpoints -- the
-    orchestrator doesn't check the key for them -- so a caller with no stored
-    login shouldn't be blocked from reading them. Anything that mutates state
-    still goes through _creds, which the server does enforce.
+    Job status and logs by id are public read endpoints -- the orchestrator
+    doesn't check the key for them -- so a caller with no stored login
+    shouldn't be blocked from reading them. Session status needs a key:
+    without one the server answers 401, which ``_request_failed`` turns into a
+    sign-in hint. Anything that mutates state goes through _creds.
     """
     api_url = args.api_url or _client.DEFAULT_API_URL
     api_key = (
@@ -199,8 +203,13 @@ def cmd_run(args: argparse.Namespace) -> None:
 
     app = _app._registry[-1]
 
-    if args.fpga_id is not None:
-        app.fpga_id = args.fpga_id
+    if getattr(args, "fpga_id", None) is not None:
+        sys.exit(
+            "error: --fpga-id was removed: the server picks the board and you "
+            "reach it through your session.\n"
+            "  'mrg run --no-program' reconnects to the session you hold; "
+            "--session ID picks one if you hold several."
+        )
     if args.sys_clk_freq is not None:
         app.sys_clk_freq = args.sys_clk_freq
     if args.timing_target_mhz is not None:
@@ -213,6 +222,8 @@ def cmd_run(args: argparse.Namespace) -> None:
         app.top = args.top
     if args.transport is not None:
         app.transport = args.transport
+    if getattr(args, "local", False):
+        app.local = True
     if args.api_url:
         app.api_url = args.api_url
     if args.api_key:
@@ -229,7 +240,12 @@ def cmd_run(args: argparse.Namespace) -> None:
     if not app._entrypoint:
         sys.exit("error: no @app.local_entrypoint() found in file")
 
-    if not args.no_program:
+    wanted = getattr(args, "session", None)
+    if wanted is not None or args.no_program:
+        # Reconnect to a session you hold instead of building.
+        app.session_id = _resolve_session(wanted, app.api_key, app.api_url)
+        app._programmed = True
+    else:
         app._program()
 
     app._entrypoint()
@@ -293,65 +309,178 @@ def _print_active_builds(api_key: str, api_url: str, now: datetime) -> None:
     print()
 
 
+def _request_failed(exc: requests.HTTPError) -> None:
+    """Exit with a readable message for the errors a user can hit (not signed
+    in; a session that is over or isn't theirs; an admin-only command);
+    re-raise anything else."""
+    status = exc.response.status_code if exc.response is not None else None
+    if status == 401:
+        sys.exit(
+            "error: this needs you to be signed in.\n"
+            "  run 'mrg login', set $MRG_API_KEY, or pass --api-key"
+        )
+    if status == 404:
+        sys.exit(
+            "error: no such session, it has ended, or it isn't yours.\n"
+            "  'mrg status' lists the sessions you hold."
+        )
+    if status in (403, 410):
+        sys.exit("error: --board is for operators (admin accounts) only.")
+    raise exc
+
+
+def _resolve_session(wanted: str | None, api_key: str, api_url: str) -> str:
+    """The session id to act on: ``wanted`` (a full id, or the 8-character
+    prefix 'mrg status' shows), else the one session you hold."""
+    if wanted is not None and len(wanted) >= 32:
+        return wanted
+    if wanted is not None and wanted.isdigit() and len(wanted) < 8:
+        sys.exit(
+            f"error: {wanted!r} looks like a board number. Boards aren't "
+            "addressed by number any more; 'mrg status' lists your sessions."
+        )
+    try:
+        sessions = _client.list_sessions(api_key, api_url)
+    except requests.HTTPError as exc:
+        _request_failed(exc)
+    ids = [s["session_id"] for s in sessions]
+    if wanted is not None:
+        ids = [i for i in ids if i.startswith(wanted)]
+        if len(ids) == 1:
+            return ids[0]
+        if not ids:
+            sys.exit(
+                f"error: you hold no session starting with {wanted!r}.\n"
+                "  'mrg status' lists the sessions you hold."
+            )
+        sys.exit(
+            f"error: {wanted!r} matches several of your sessions; give more of it."
+        )
+    if len(ids) == 1:
+        return ids[0]
+    if not ids:
+        sys.exit(
+            "error: you don't hold a board right now. 'mrg run' gets you one."
+        )
+    listed = ", ".join(_short(i) for i in ids)
+    sys.exit(f"error: you hold several sessions ({listed}); pick one with --session.")
+
+
+def _target(args: argparse.Namespace, api_key: str, api_url: str):
+    """What a board command acts on: an admin's --board, else your session."""
+    board = getattr(args, "board", None)
+    if board is not None:
+        return board
+    return _resolve_session(getattr(args, "session", None), api_key, api_url)
+
+
+def _print_session(d: dict, now: datetime) -> None:
+    print(f"\n  session {d['session_id']}")
+    if d.get("fpga_id") is not None:  # only ever sent to admins
+        print(f"  {'board:':<14} {d['fpga_id']}")
+    print(f"  {'state:':<14} {_fmt_state(d['state'])}")
+    print(f"  {'held for:':<14} {_elapsed_since(d.get('created_at'), now)}")
+    print(f"  {'expires at:':<14} {d.get('expires_at', '-')}")
+    cj = d.get("current_job_id")
+    print(f"  {'current job:':<14} {_c(cj, _DIM) if cj else _c('-', _DIM)}")
+    if cj:
+        job_age = _elapsed_since(d.get("current_job_created_at"), now)
+        print(f"  {'job age:':<14} {job_age}")
+    print()
+
+
+def _print_board(d: dict, now: datetime) -> None:
+    """One board, by id (the admin view)."""
+    sess = d.get("session") or {}
+    print(f"\n  board {d['fpga_id']}")
+    print(f"  {'state:':<14} {_fmt_state(d['state'])}")
+    owner = d.get("owner")
+    print(f"  {'owner:':<14} {owner if owner else _c('-', _DIM)}")
+    if sess:
+        print(f"  {'session:':<14} {sess.get('session_id', '-')}")
+        print(f"  {'expires at:':<14} {sess.get('expires_at', '-')}")
+        print(f"  {'held for:':<14} {_elapsed_since(sess.get('created_at'), now)}")
+    else:
+        print(f"  {'session:':<14} {_c('-', _DIM)}")
+    cj = d.get("current_job_id")
+    print(f"  {'current job:':<14} {_c(cj, _DIM) if cj else _c('-', _DIM)}")
+    if cj:
+        job_age = _elapsed_since(d.get("current_job_created_at"), now)
+        print(f"  {'job age:':<14} {job_age}")
+    print()
+
+
+def _print_fleet(fpgas: list[dict], now: datetime) -> None:
+    """Every board (the admin view)."""
+    header = (
+        f"  {'BOARD':>5}  {'STATE':<14}  {'OWNER':<12}  "
+        f"{'HELD FOR':<12}  {'JOB AGE':<12}  CURRENT JOB"
+    )
+    print()
+    print(_c(header, _BOLD))
+    print(_c("  " + "─" * (len(header) - 2), _DIM))
+    for d in fpgas:
+        owner = d.get("owner") or "-"
+        held_for = _elapsed_since((d.get("session") or {}).get("created_at"), now)
+        job_age = _elapsed_since(d.get("current_job_created_at"), now)
+        print(
+            f"  {d['fpga_id']:>5}  {_fmt_state(d['state']):<14}  {owner:<12}  "
+            f"{held_for:<12}  {job_age:<12}  {_fmt_id(d.get('current_job_id'))}"
+        )
+    print()
+
+
 def cmd_status(args: argparse.Namespace) -> None:
     api_key, api_url = _creds_optional(args)
     now = datetime.now(UTC)
-
-    if args.fpga_id is not None:
-        # Single FPGA detail view
-        d = _client.get_fpga(args.fpga_id, api_key, api_url)
-        if args.json:
-            print(json.dumps(d, indent=2))
-            return
-        _print_server_version(api_url)
-        sess = d.get("session") or {}
-        print(f"\n  FPGA {d['fpga_id']}")
-        print(f"  {'state:':<14} {_fmt_state(d['state'])}")
-        owner = d.get("owner")
-        print(f"  {'owner:':<14} {owner if owner else _c('-', _DIM)}")
-        if sess:
-            print(f"  {'session:':<14} {sess.get('session_id', '-')}")
-            print(f"  {'expires at:':<14} {sess.get('expires_at', '-')}")
-            held_for = _elapsed_since(sess.get("created_at"), now)
-            print(f"  {'held for:':<14} {held_for}")
+    board = getattr(args, "board", None)
+    try:
+        if getattr(args, "boards", False):
+            data = _client.list_fpgas(api_key, api_url)
+        elif board is not None:
+            data = _client.get_fpga(board, api_key, api_url)
+        elif getattr(args, "session", None) is not None:
+            sid = _resolve_session(args.session, api_key, api_url)
+            data = _client.get_session(sid, api_key, api_url)
         else:
-            print(f"  {'session:':<14} {_c('-', _DIM)}")
-        cj = d.get("current_job_id")
-        print(f"  {'current job:':<14} {_c(cj, _DIM) if cj else _c('-', _DIM)}")
-        if cj:
-            job_age = _elapsed_since(d.get("current_job_created_at"), now)
-            print(f"  {'job age:':<14} {job_age}")
-        print()
-    else:
-        # All-FPGAs table
-        fpgas = _client.list_fpgas(api_key, api_url)
-        if args.json:
-            print(json.dumps(fpgas, indent=2))
-            return
-        _print_server_version(api_url)
-        header = (
-            f"  {'ID':>2}  {'STATE':<14}  {'OWNER':<12}  "
-            f"{'HELD FOR':<12}  {'JOB AGE':<12}  CURRENT JOB"
-        )
-        sep    = "  " + "─" * (len(header) - 2)
-        print()
-        print(_c(header, _BOLD))
-        print(_c(sep, _DIM))
-        for d in fpgas:
-            owner = d.get("owner") or "-"
-            cj    = d.get("current_job_id")
-            held_for = _elapsed_since((d.get("session") or {}).get("created_at"), now)
-            job_age = _elapsed_since(d.get("current_job_created_at"), now)
-            print(
-                f"  {d['fpga_id']:>2}  "
-                f"{_fmt_state(d['state']):<14}  "
-                f"{owner:<12}  "
-                f"{held_for:<12}  {job_age:<12}  "
-                f"{_fmt_id(cj)}"
-            )
-        print()
+            data = _client.list_sessions(api_key, api_url)
+    except requests.HTTPError as exc:
+        _request_failed(exc)
+    if args.json:
+        print(json.dumps(data, indent=2))
+        return
+    _print_server_version(api_url)
+    if getattr(args, "boards", False):
+        _print_fleet(data, now)
+        return
+    if board is not None:
+        _print_board(data, now)
+        return
+    if getattr(args, "session", None) is not None:
+        _print_session(data, now)
+        return
+    if not data:
+        print("\n  You don't hold a board right now. 'mrg run' gets you one.\n")
         if api_key:
             _print_active_builds(api_key, api_url, now)
+        return
+    header = (
+        f"  {'SESSION':<10}  {'STATE':<14}  {'HELD FOR':<12}  "
+        f"{'JOB AGE':<12}  CURRENT JOB"
+    )
+    print()
+    print(_c(header, _BOLD))
+    print(_c("  " + "─" * (len(header) - 2), _DIM))
+    for d in data:
+        held_for = _elapsed_since(d.get("created_at"), now)
+        job_age = _elapsed_since(d.get("current_job_created_at"), now)
+        print(
+            f"  {_short(d['session_id']):<10}  {_fmt_state(d['state']):<14}  "
+            f"{held_for:<12}  {job_age:<12}  {_fmt_id(d.get('current_job_id'))}"
+        )
+    print()
+    if api_key:
+        _print_active_builds(api_key, api_url, now)
 
 
 # ``mrg jobs --type`` values -> the job types they show.
@@ -391,7 +520,7 @@ def cmd_jobs(args: argparse.Namespace) -> None:
     now = datetime.now(UTC)
     header = (
         f"  {'JOB_ID':<10}  {'TYPE':<18}  {'STATUS':<10}  "
-        f"{'FPGA':<5}  {'ELAPSED':<12}  CREATED"
+        f"{'SESSION':<9}  {'ELAPSED':<12}  CREATED"
     )
     sep    = "  " + "─" * (len(header) - 2)
     print()
@@ -402,7 +531,7 @@ def cmd_jobs(args: argparse.Namespace) -> None:
             f"  {_fmt_id(d['job_id']):<10}  "
             f"{d['type']:<18}  "
             f"{_fmt_status(d['status']):<10}  "
-            f"{_fmt_fpga(d.get('fpga_id')):<5}  "
+            f"{_short(d.get('session_id')):<9}  "
             f"{_job_elapsed(d, now):<12}  "
             f"{d['created_at']}"
         )
@@ -417,18 +546,36 @@ def cmd_jobs(args: argparse.Namespace) -> None:
     print()
 
 
+def _job_id(args: argparse.Namespace, api_key: str, api_url: str) -> str:
+    """The full job id for ``args.job_id``, which may be the short form
+    ``mrg jobs`` prints (a unique prefix)."""
+    try:
+        return _client.resolve_job_id(args.job_id, api_key, api_url)
+    except ValueError as exc:
+        sys.exit(f"error: {exc}.\n  'mrg jobs' lists your jobs.")
+    except requests.HTTPError as exc:
+        if exc.response is not None and exc.response.status_code == 401:
+            sys.exit(
+                "error: a short job id needs you to be signed in; pass the "
+                "full id or run 'mrg login'."
+            )
+        raise
+
+
 def cmd_job(args: argparse.Namespace) -> None:
     api_key, api_url = _creds_optional(args)
-    d = _client.get_job(args.job_id, api_key, api_url)
+    d = _client.get_job(_job_id(args, api_key, api_url), api_key, api_url)
     if args.json:
         print(json.dumps(d, indent=2))
         return
-    fpga_id = d["fpga_id"]
-    fpga_display = (
-        fpga_id if fpga_id is not None else _c("- (no board assigned yet)", _DIM)
+    session_id = d.get("session_id")
+    session_display = (
+        session_id if session_id else _c("- (not on a board yet)", _DIM)
     )
     print(f"\n  {'job_id:':<14} {d['job_id']}")
-    print(f"  {'fpga_id:':<14} {fpga_display}")
+    print(f"  {'session:':<14} {session_display}")
+    if d.get("fpga_id") is not None:  # only ever sent to admins
+        print(f"  {'board:':<14} {d['fpga_id']}")
     print(f"  {'type:':<14} {d['type']}")
     print(f"  {'status:':<14} {_fmt_status(d['status'])}")
     print(f"  {'created at:':<14} {d['created_at']}")
@@ -439,23 +586,41 @@ def cmd_job(args: argparse.Namespace) -> None:
 
 def cmd_logs(args: argparse.Namespace) -> None:
     api_key, api_url = _creds_optional(args)
-    text = _client.get_logs(args.job_id, api_key, api_url)
+    text = _client.get_logs(_job_id(args, api_key, api_url), api_key, api_url)
     print(text)
 
 
 def cmd_cancel(args: argparse.Namespace) -> None:
     api_key, api_url = _creds(args)
-    _client.cancel_job(args.job_id, api_key, api_url)
-    print(f"cancelled {args.job_id}")
+    job_id = _job_id(args, api_key, api_url)
+    _client.cancel_job(job_id, api_key, api_url)
+    print(f"cancelled {job_id}")
 
 
 def cmd_reset(args: argparse.Namespace) -> None:
     api_key, api_url = _creds(args)
-    d = _client.reset_fpga(args.fpga_id, api_key, api_url)
+    if getattr(args, "session", None) is None:
+        args.session = getattr(args, "legacy_board", None)  # `mrg reset <id>`
+    target = _target(args, api_key, api_url)
+    try:
+        d = _client.reset_session(target, api_key, api_url)
+    except requests.HTTPError as exc:
+        _request_failed(exc)
     print(f"reset job queued: {d['job_id']}")
 
 
+def _no_board_numbers(args: argparse.Namespace, usage: str) -> None:
+    """``mrg read 3 0x0`` / ``mrg write 3 0x0 1``: the old forms, which led
+    with a board number."""
+    if getattr(args, "extra", None) is not None:
+        sys.exit(
+            "error: boards aren't addressed by number any more.\n"
+            f"  usage: {usage}  (acts on your session; --session ID to pick one)"
+        )
+
+
 def cmd_read(args: argparse.Namespace) -> None:
+    _no_board_numbers(args, "mrg read ADDRESS [--count N]")
     api_key, api_url = _creds(args)
     data = _one_call(
         args, api_key, api_url, lambda t: t.read(args.address, args.count)
@@ -465,16 +630,19 @@ def cmd_read(args: argparse.Namespace) -> None:
 
 
 def cmd_write(args: argparse.Namespace) -> None:
+    _no_board_numbers(args, "mrg write ADDRESS VALUE")
     api_key, api_url = _creds(args)
     _one_call(args, api_key, api_url, lambda t: t.write(args.address, [args.value]))
     print(f"  {hex(args.address)} ← {args.value:#010x}")
 
 
 def _one_call(args: argparse.Namespace, api_key: str, api_url: str, call):
-    """Open a transport to args.fpga_id, make one call, always close it."""
+    """Open a transport to your session (or an admin's --board), make one
+    call, always close it."""
+    target = _target(args, api_key, api_url)
     try:
         transport = _transport.open_transport(
-            args.transport, args.fpga_id, api_key, api_url
+            args.transport, target, api_key, api_url
         )
     except ValueError as exc:  # a bad $MRG_TRANSPORT
         sys.exit(f"error: {exc}")
@@ -699,10 +867,19 @@ def main() -> None:
                        help="explicit source relative to --include-dir or the design "
                             "folder; disables discovery (repeatable)")
     run_p.add_argument("file", help="Python file defining an App")
+    run_p.add_argument("--session", default=None, metavar="ID",
+                       help="reconnect to this session you hold instead of "
+                            "building (implies --no-program)")
+    # Removed: kept only to say so instead of argparse's "unrecognized".
     run_p.add_argument("--fpga-id", type=int, default=None, dest="fpga_id",
-                       help="override the fpga_id set in the file")
+                       help=argparse.SUPPRESS)
+    run_p.add_argument("--local", action="store_true",
+                       help="build the bitstream on this machine (Docker, pinned "
+                            "build image) and upload it, instead of building on "
+                            "the server")
     run_p.add_argument("--no-program", action="store_true", dest="no_program",
-                       help="skip programming (FPGA already has the design loaded)")
+                       help="skip programming: reconnect to the session you "
+                            "hold (its board already has the design)")
     run_p.add_argument("--sys-clk", type=lambda s: int(float(s)), default=None,
                        dest="sys_clk_freq", metavar="HZ",
                        help="override the SoC compute clock in Hz, e.g. 90e6 "
@@ -751,11 +928,23 @@ def main() -> None:
                        help="timing constraint PnR optimizes against and timing_met "
                             "is graded on (default: the sys clock)")
 
-    # status [fpga_id]
-    st_p = sub.add_parser("status", parents=[common],
-                          help="show FPGA states (all, or one if fpga_id given)")
-    st_p.add_argument("fpga_id", nargs="?", type=int, default=None,
-                      help="FPGA id (omit for the full table)")
+    # Admin-only: name a physical board (the server refuses anyone else).
+    board_opt = argparse.ArgumentParser(add_help=False)
+    board_opt.add_argument("--board", type=int, default=None, metavar="N",
+                           help="operators only: act on board N by number")
+    session_opt = argparse.ArgumentParser(add_help=False)
+    session_opt.add_argument("--session", default=None, metavar="ID",
+                             help="which of your sessions (id or its first 8 "
+                                  "characters); default: the one you hold")
+
+    # status [session]
+    st_p = sub.add_parser("status", parents=[common, board_opt],
+                          help="show your sessions (all, or one if given)")
+    st_p.add_argument("session", nargs="?", default=None,
+                      help="session id or its first 8 characters "
+                           "(omit for all of yours)")
+    st_p.add_argument("--boards", action="store_true",
+                      help="operators only: every board, by number")
     st_p.add_argument("--json", action="store_true",
                       help="print the raw orchestrator response as JSON")
 
@@ -790,39 +979,47 @@ def main() -> None:
 
     # job <job_id>
     job_p = sub.add_parser("job", parents=[common], help="show job status and metadata")
-    job_p.add_argument("job_id")
+    job_p.add_argument("job_id", help="full id or the short id from 'mrg jobs'")
     job_p.add_argument("--json", action="store_true",
                        help="print the raw orchestrator response as JSON")
 
     # logs <job_id>
     log_p = sub.add_parser("logs", parents=[common], help="print build logs for a job")
-    log_p.add_argument("job_id")
+    log_p.add_argument("job_id", help="full id or the short id from 'mrg jobs'")
 
     # cancel <job_id>
     can_p = sub.add_parser("cancel", parents=[common], help="cancel a job")
-    can_p.add_argument("job_id")
+    can_p.add_argument("job_id", help="full id or the short id from 'mrg jobs'")
 
-    # reset <fpga_id>
-    res_p = sub.add_parser("reset", parents=[common],
-                           help="reset an FPGA back to idle (reflashes base SoC)")
-    res_p.add_argument("fpga_id", type=int)
+    # reset [session]
+    res_p = sub.add_parser(
+        "reset", parents=[common, board_opt, session_opt],
+        help="end your session and wipe its board (reflashes base SoC)",
+    )
+    res_p.add_argument("legacy_board", nargs="?", default=None, metavar="SESSION",
+                       help="same as --session")
 
-    # read <fpga_id> <addr>
-    read_p = sub.add_parser("read", parents=[common, transport_opt],
-                            help="read 32-bit word(s) from a live FPGA")
-    read_p.add_argument("fpga_id", type=int)
-    read_p.add_argument("address", type=lambda s: int(s, 0),
+    def _int0(s: str) -> int:
+        return int(s, 0)
+
+    # read <addr>
+    read_p = sub.add_parser("read", parents=[common, transport_opt, board_opt,
+                                             session_opt],
+                            help="read 32-bit word(s) from your board")
+    read_p.add_argument("address", type=_int0,
                         help="byte address (hex or decimal)")
+    read_p.add_argument("extra", nargs="?", default=None, help=argparse.SUPPRESS)
     read_p.add_argument("--count", type=int, default=1)
 
-    # write <fpga_id> <addr> <value>
-    wr_p = sub.add_parser("write", parents=[common, transport_opt],
-                          help="write a 32-bit word to a live FPGA")
-    wr_p.add_argument("fpga_id", type=int)
-    wr_p.add_argument("address", type=lambda s: int(s, 0),
+    # write <addr> <value>
+    wr_p = sub.add_parser("write", parents=[common, transport_opt, board_opt,
+                                            session_opt],
+                          help="write a 32-bit word to your board")
+    wr_p.add_argument("address", type=_int0,
                       help="byte address (hex or decimal)")
-    wr_p.add_argument("value", type=lambda s: int(s, 0),
+    wr_p.add_argument("value", type=_int0,
                       help="32-bit value (hex or decimal)")
+    wr_p.add_argument("extra", nargs="?", default=None, help=argparse.SUPPRESS)
 
     # admin [online|offline <fpga_id>...]
     adm_p = sub.add_parser(

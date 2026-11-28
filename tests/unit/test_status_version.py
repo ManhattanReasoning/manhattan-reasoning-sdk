@@ -7,8 +7,9 @@ import requests
 
 from manhattan_reasoning_gym import _cli, _client
 
+SESSION = "5f0c6f1e-2b7a-4c1e-9d8f-3a2b1c0d9e8f"
 
-@pytest.mark.parametrize("fpga_id", [None, 0])
+@pytest.mark.parametrize("session", [None, SESSION])
 @pytest.mark.parametrize(
     "response,expected",
     [
@@ -19,37 +20,37 @@ from manhattan_reasoning_gym import _cli, _client
     ],
 )
 def test_status_version_preserves_board_display(
-    monkeypatch, capsys, fpga_id, response, expected
+    monkeypatch, capsys, session, response, expected
 ):
     monkeypatch.setattr(_cli, "_creds_optional", lambda args: (None, "https://example"))
-    board = {"fpga_id": 0, "state": "idle", "session": None, "current_job_id": None}
-    monkeypatch.setattr(_client, "list_fpgas", lambda *args: [board])
-    monkeypatch.setattr(_client, "get_fpga", lambda *args: board)
+    board = {"session_id": SESSION, "state": "reserved", "current_job_id": None}
+    monkeypatch.setattr(_client, "list_sessions", lambda *args: [board])
+    monkeypatch.setattr(_client, "get_session", lambda *args: board)
     mock = (
         Mock(side_effect=response)
         if isinstance(response, Exception)
         else Mock(return_value=response)
     )
     monkeypatch.setattr(_client, "get_health", mock)
-    _cli.cmd_status(argparse.Namespace(fpga_id=fpga_id, json=False))
+    _cli.cmd_status(argparse.Namespace(session=session, json=False))
     out = capsys.readouterr().out
     assert expected in out
-    assert "idle" in out
+    assert "reserved" in out
 
 
-@pytest.mark.parametrize("fpga_id", [None, 0])
+@pytest.mark.parametrize("session", [None, SESSION])
 def test_status_json_keeps_original_shape_and_skips_health(
-    monkeypatch, capsys, fpga_id
+    monkeypatch, capsys, session
 ):
     monkeypatch.setattr(_cli, "_creds_optional", lambda args: (None, "https://example"))
-    board = {"fpga_id": 0, "state": "idle"}
-    monkeypatch.setattr(_client, "list_fpgas", lambda *args: [board])
-    monkeypatch.setattr(_client, "get_fpga", lambda *args: board)
+    board = {"session_id": SESSION, "state": "reserved"}
+    monkeypatch.setattr(_client, "list_sessions", lambda *args: [board])
+    monkeypatch.setattr(_client, "get_session", lambda *args: board)
     health = Mock(side_effect=AssertionError("JSON must not fetch health"))
     monkeypatch.setattr(_client, "get_health", health)
-    _cli.cmd_status(argparse.Namespace(fpga_id=fpga_id, json=True))
+    _cli.cmd_status(argparse.Namespace(session=session, json=True))
     assert json.loads(capsys.readouterr().out) == (
-        [board] if fpga_id is None else board
+        [board] if session is None else board
     )
 
 
