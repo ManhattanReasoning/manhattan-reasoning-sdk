@@ -365,6 +365,27 @@ def get_fpga(fpga_id: int, api_key: str, api_url: str) -> dict:
     return resp.json()
 
 
+def admin_list_fpgas(api_key: str, api_url: str) -> list[dict]:
+    """Every board in physical stack order, top first (admin-only)."""
+    resp = requests.get(
+        f"{api_url}/admin/fpga", headers={"X-API-Key": api_key}, timeout=15.0
+    )
+    resp.raise_for_status()
+    return resp.json()
+
+
+def set_fpga_online(fpga_id: int, online: bool, api_key: str, api_url: str) -> dict:
+    """Bring a board into, or take it out of, the build rotation (admin-only)."""
+    action = "online" if online else "offline"
+    resp = requests.post(
+        f"{api_url}/fpga/{fpga_id}/{action}",
+        headers={"X-API-Key": api_key},
+        timeout=15.0,
+    )
+    resp.raise_for_status()
+    return resp.json()
+
+
 def resolve_job_id(job_id: str, api_key: str, api_url: str) -> str:
     """Turn a job id or a unique prefix of one (as ``mrg jobs`` prints) into
     the full id.
