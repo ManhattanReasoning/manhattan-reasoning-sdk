@@ -1,5 +1,24 @@
 # Changelog
 
+## Unreleased
+
+### Changed
+
+- `mrg run --local` / `App(local=True)` builds first and only then creates
+  the job and uploads, when the build image has the flash-time identity ROM.
+  A long build can no longer outlive its reservation. Against a server that
+  still reserves a build slot, the slot's identity is written into the
+  finished bitstream (no rebuild); with an older image the old
+  reserve-then-build order is kept.
+- A successful local build prints a timing/utilisation summary and writes it
+  to `build.log` (which used to be empty on success).
+
+### Fixed
+
+- `app.write()` splits writes longer than 256 words into 256-word bursts (same
+  address with `fixed_address=True`, consecutive addresses otherwise). A
+  4096-word burst made the board host fail with 4502 "Board link failed".
+
 ## 0.2.1
 
 ### Fixed

@@ -175,24 +175,36 @@ mrg run --local examples/app.py
 mrg run --local examples/app.py --sys-clk 75e6 --timing-target-mhz 80
 ```
 
-What it does:
+What it does, with a current build image (one whose SoC has the flash-time
+identity ROM):
 
-1. Reserves a build slot (`POST /builds/local`) and gets back a `job_id`, the
-   slot's IP, and an upload deadline (30 min by default).
-2. Builds the design for that slot in Docker (`--network=none`). Output goes to
-   a temp folder `mrg-local-<first 8 chars of job_id>-*` holding `design.bit`, `manifest.json`
-   (sha256, image digest, git revision), and `build.log`; the path is printed.
+1. Builds the design in Docker (`--network=none`) **before** asking the server
+   for anything, so no reservation can expire however long the build takes.
+   Every build is the same for every board: the board's network identity is a
+   fixed placeholder that the board host replaces when it flashes the board.
+   Output goes to a temp folder `mrg-local-*` holding `design.bit`,
+   `manifest.json` (sha256, image digest, git revision), and `build.log`; the
+   path is printed, and so is a timing/utilisation summary (Fmax per clock,
+   resource use, stage times).
+2. Creates the job (`POST /builds/local`), retrying for up to 10 minutes while
+   the server answers `503 no_build_capacity`.
 3. Uploads the bitstream and manifest (`PUT /jobs/{job_id}/bitstream`). The
    server answers `queued`, flashes a board, and the job ends `complete`.
 4. Waits for the board, then runs your `@app.local_entrypoint()` as usual.
+
+If the server still hands out a build slot in step 2 (a server from before
+flash-time identity), the SDK writes that slot's identity into the finished
+bitstream itself (`ecpbram` in the build image, a few seconds, verified) and
+uploads `design.slot<N>.bit`. With an older build image that has no identity
+ROM, the SDK falls back to the old order: reserve a slot, build for it, upload
+before the deadline (30 min by default; past it the upload gets `410` and you
+run `mrg run --local` again).
 
 In Python, use `mrg.cloud.App(..., local=True)`. Notes:
 
 - Needs Docker. Set `$MRG_LOCAL_BUILD_IMAGE` to use another image tag or digest.
 - One local build in flight per user; a second reserve gets `402 build_in_flight`.
 - Single design file only (`--include-dir` / `--source` are not supported yet).
-- If the build runs past the deadline, the upload gets `410`; run
-  `mrg run --local` again to reserve a new slot.
 
 ## Authentication (cloud only)
 

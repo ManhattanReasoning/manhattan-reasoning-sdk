@@ -178,14 +178,29 @@ def _raise_api_error(resp) -> None:
     )
 
 
-def reserve_local_build(api_key: str, api_url: str) -> dict:
-    """Reserve a build slot for a build that runs on this machine.
+#: Added to CLIENT_FEATURES by a local build whose bitstream carries the
+#: placeholder identity: the server may then leave ``slot_id`` out of the
+#: reservation and give the board its identity when it flashes it.
+FLASH_IDENTITY_FEATURE = "flash-identity"
 
-    Returns ``job_id``, ``slot_id`` (bake it in as FPGA_ID), ``ip``, ``mac``
-    and ``expires_at`` (the upload deadline).
+
+def reserve_local_build(
+    api_key: str, api_url: str, *, flash_identity: bool = False
+) -> dict:
+    """Create the job a bitstream built on this machine is uploaded to.
+
+    Returns ``job_id`` and, from a server that bakes the network identity in
+    at build time, ``slot_id``, ``ip``, ``mac`` and ``expires_at`` (the
+    upload deadline). ``flash_identity=True`` tells the server the bitstream
+    carries the placeholder identity; a server that assigns identity at flash
+    time then sends no ``slot_id`` (or a null one).
     """
+    features = CLIENT_FEATURES["X-MRG-Client-Features"]
+    if flash_identity:
+        features += f",{FLASH_IDENTITY_FEATURE}"
     resp = requests.post(
-        f"{api_url}/builds/local", headers={"X-API-Key": api_key, **CLIENT_FEATURES}
+        f"{api_url}/builds/local",
+        headers={"X-API-Key": api_key, "X-MRG-Client-Features": features},
     )
     _raise_api_error(resp)
     return resp.json()

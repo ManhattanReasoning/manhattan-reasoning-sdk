@@ -272,6 +272,60 @@ def test_burst_write_is_one_message(server, transports):
     assert len(server.requests) == 1
 
 
+def _decode_write(raw: bytes) -> tuple[int, int, list[int]]:
+    """(opcode byte, address, words) of a WRITE request frame."""
+    length = struct.unpack(">I", b"\x00" + raw[1:4])[0]
+    address = struct.unpack(">I", raw[4:8])[0]
+    return raw[0], address, list(struct.unpack(f">{length}I", raw[8:]))
+
+
+def test_large_fixed_address_write_is_split_into_256_word_bursts(server, transports):
+    # A 4096-word burst made the board host fail with 4502; 256 works.
+    words = list(range(4096))
+    transports(server).write(0x40, words, fixed_address=True)
+    frames = [_decode_write(raw) for raw in server.requests]
+    assert len(frames) == 16
+    assert all(op == 0x01 | 0x80 for op, _, _ in frames)
+    assert all(addr == 0x40 for _, addr, _ in frames)
+    assert all(len(data) == 256 for _, _, data in frames)
+    assert [w for _, _, data in frames for w in data] == words
+
+
+def test_large_incrementing_write_advances_the_address_per_burst(server, transports):
+    words = list(range(600))
+    transports(server).write(0x100, words)
+    frames = [_decode_write(raw) for raw in server.requests]
+    assert [(op, addr, len(data)) for op, addr, data in frames] == [
+        (0x01, 0x100, 256),
+        (0x01, 0x100 + 4 * 256, 256),
+        (0x01, 0x100 + 4 * 512, 88),
+    ]
+    assert [w for _, _, data in frames for w in data] == words
+
+
+def test_write_of_exactly_the_cap_is_one_burst(server, transports):
+    transports(server).write(0x0, [7] * _transport.MAX_WRITE_BURST_WORDS)
+    assert len(server.requests) == 1
+
+
+def test_failed_burst_names_which_one(server, transports):
+    server.replies = [_response_bytes(0x00, []), _response_bytes(0x01, [])]
+    with pytest.raises(RuntimeError, match=r"burst 2/2, 44 words\) failed"):
+        transports(server).write(0x0, [0] * 300)
+    assert len(server.requests) == 2
+
+
+def test_http_transport_splits_large_writes(monkeypatch):
+    seen = []
+
+    def fake_write(target, api_key, address, words, api_url, fixed_address=False):
+        seen.append((address, len(words), fixed_address))
+
+    monkeypatch.setattr(_transport._client, "write", fake_write)
+    _transport.HttpTransport("s", "k", "u").write(0x8, [1] * 513, fixed_address=True)
+    assert seen == [(0x8, 256, True), (0x8, 256, True), (0x8, 1, True)]
+
+
 def test_read_returns_a_list_of_words(server, transports):
     server.replies = [_response_bytes(0x00, [0x2A])]
     t = transports(server)
