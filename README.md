@@ -245,6 +245,7 @@ mrg write <addr> <value> [--session ID]
 mrg admin [online|offline <fpga_id>...] [--json]
                                             # admins only: physical stack view,
                                             # take boards in/out of rotation
+                                            # (with 3-day error counts)
 ```
 
 `mrg status` lists the sessions you hold (it needs you signed in: `mrg login`).

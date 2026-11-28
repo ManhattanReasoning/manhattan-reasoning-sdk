@@ -10,9 +10,11 @@ from manhattan_reasoning_gym import _cli, _client
 
 STACK = [
     {"fpga_id": 4, "state": "error", "online": False, "jtag_present": True,
-     "network_up": False, "owner": None},
+     "network_up": False, "owner": None,
+     "errors_last_3_days": 14},
     {"fpga_id": 2, "state": "idle", "online": True, "jtag_present": True,
-     "network_up": None, "owner": None},
+     "network_up": None, "owner": None,
+     "errors_last_3_days": 0},
     {"fpga_id": 0, "state": "reserved", "online": True, "jtag_present": None,
      "network_up": True, "owner": "alice"},
 ]
@@ -44,6 +46,19 @@ def test_stack_prints_boards_top_first_with_offline_marked(monkeypatch, capsys):
     # every row of the box is the same width
     widths = {len(line) for line in out.splitlines() if line.startswith("  │")}
     assert len(widths) == 1
+
+
+def test_stack_shows_each_boards_recent_errors(monkeypatch, capsys):
+    monkeypatch.setattr(_client, "admin_list_fpgas", lambda *a: STACK)
+    _cli.cmd_admin(_args())
+    rows = {
+        line.split()[2]: line
+        for line in capsys.readouterr().out.splitlines()
+        if line.startswith("  │")
+    }
+    assert "errors 3d 14 " in rows["4"]
+    assert "errors 3d 0 " in rows["2"]
+    assert "errors 3d - " in rows["0"]  # a server that doesn't send a count
 
 
 @pytest.mark.parametrize("action,online", [("offline", False), ("online", True)])

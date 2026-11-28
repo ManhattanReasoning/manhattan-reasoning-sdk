@@ -694,6 +694,8 @@ def _print_stack(boards: list[dict]) -> None:
         online = d.get("online", True)
         jtag, jtag_color = _tick(d.get("jtag_present"))
         net, net_color = _tick(d.get("network_up"))
+        # absent from a server that doesn't count errors yet
+        errors = d.get("errors_last_3_days")
         rows.append(
             " "
             + _cell(f"FPGA {d['fpga_id']}", 8, _BOLD)
@@ -702,9 +704,15 @@ def _print_stack(boards: list[dict]) -> None:
             + _cell(d["state"], 12, _STATE_COLOR.get(d["state"], ""))
             + "jtag " + _cell(jtag, 3, jtag_color)
             + "net " + _cell(net, 3, net_color)
+            + "errors 3d "
+            + _cell(
+                "-" if errors is None else str(errors),
+                6,
+                _YELLOW if errors else _DIM,
+            )
             + _cell((d.get("owner") or "")[:12], 12, _DIM)
         )
-    inner = 1 + 8 + 10 + 12 + 5 + 3 + 4 + 3 + 12
+    inner = 1 + 8 + 10 + 12 + 5 + 3 + 4 + 3 + 10 + 6 + 12
     print()
     print(_c("  FPGA stack (top → bottom)", _BOLD))
     print("  ┌" + "─" * inner + "┐")
