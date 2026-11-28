@@ -6,6 +6,7 @@ import signal
 import sys
 import tempfile
 import threading
+import time
 import warnings
 from collections.abc import Callable
 from pathlib import Path
@@ -316,11 +317,20 @@ class App:
     def _program_local(self) -> None:
         """Build the bitstream here, upload it, and block until it's flashed.
 
-        The server reserves a build slot first (its MAC/IP must be baked into
-        the bitstream), the build runs in the pinned image on this machine,
-        and the upload hands the job to the same flash queue a cloud build
-        uses. Any failure before the flash finishes cancels the reservation so
-        the slot goes straight back to the pool.
+        The build runs in the pinned image on this machine, and the upload
+        hands the job to the same flash queue a cloud build uses. How the
+        board's network identity gets in depends on the image (see
+        ``_local_bitstream``):
+
+        - Flash-time identity: build first, holding nothing on the server, so
+          no reservation can expire however long the build takes; then create
+          the job and upload. If the server still reserves a build slot, that
+          slot's identity is patched into the finished bitstream first.
+        - Build-time identity (older image): reserve a slot, build for it,
+          upload before the reservation expires.
+
+        Any failure after the job exists cancels it, so a reserved slot goes
+        straight back to the pool.
         """
         if self.sources is not None or self.include_dir is not None:
             raise ValueError(
@@ -329,24 +339,88 @@ class App:
             )
         from . import _local_bitstream
 
+        image = _local_bitstream.resolve_image()
+        placeholder = _local_bitstream.identity_placeholder(image)
+        if placeholder is None:
+            self._program_local_slot_first(image)
+        else:
+            self._program_local_build_first(image, placeholder)
+
+    def _local_build(self, out_dir: Path, image: str, slot_id: int | None):
+        from . import _local_bitstream
+
+        built = _local_bitstream.build_bitstream(
+            self.design,
+            slot_id=slot_id,
+            out_dir=out_dir,
+            sys_clk_freq=self.sys_clk_freq,
+            timing_target_mhz=self.timing_target_mhz,
+            top=self.top,
+            image=image,
+        )
+        if built.summary:
+            print(f"[{self.name}] {built.summary}", flush=True)
+        return built
+
+    def _program_local_build_first(self, image: str, placeholder: list[int]) -> None:
+        from . import _local_bitstream
+
+        out_dir = Path(tempfile.mkdtemp(prefix="mrg-local-"))
+        print(
+            f"[{self.name}] building locally (no board reserved until the "
+            f"build finishes). Output: {out_dir}",
+            flush=True,
+        )
+        built = self._local_build(out_dir, image, None)
+        res = _reserve_after_build(
+            self.name, self.api_key, self.api_url, built.path
+        )
+        job_id = res["job_id"]
+        try:
+            slot_id = res.get("slot_id")
+            if slot_id is not None:
+                # A server from before flash-time identity: it flashes what it
+                # gets, and talks to the board at the reserved slot's address.
+                print(
+                    f"[{self.name}] server reserved build slot {slot_id} "
+                    f"(IP {res['ip']}); writing its identity into the bitstream",
+                    flush=True,
+                )
+                built = _local_bitstream.patch_identity(
+                    built, image=image, placeholder=placeholder,
+                    slot_id=slot_id, ip=res["ip"], mac=res["mac"],
+                )
+            _client.upload_bitstream(
+                job_id, built.path, built.manifest, self.api_key, self.api_url
+            )
+        except BaseException:
+            _cancel_quietly(job_id, self.api_key, self.api_url)
+            raise
+        self._wait_for_board(job_id)
+
+    def _program_local_slot_first(self, image: str) -> None:
         res = _client.reserve_local_build(self.api_key, self.api_url)
         job_id = res["job_id"]
         try:
+            slot_id = res.get("slot_id")
+            if slot_id is None:
+                from ._local_bitstream import LocalBuildError
+
+                raise LocalBuildError(
+                    "the server assigns each board its network identity at "
+                    "flash time, but this local build image bakes it in at "
+                    "build time. Rebuild the image from the current Cloud repo "
+                    "(docker build --platform linux/amd64 -f "
+                    "infra/fargate/Dockerfile -t mrg-local-build:latest .)."
+                )
             out_dir = Path(tempfile.mkdtemp(prefix=f"mrg-local-{job_id[:8]}-"))
             print(
-                f"[{self.name}] reserved build slot {res['slot_id']} "
+                f"[{self.name}] reserved build slot {slot_id} "
                 f"(IP {res['ip']}); building locally, upload due by "
                 f"{res['expires_at']}. Output: {out_dir}",
                 flush=True,
             )
-            built = _local_bitstream.build_bitstream(
-                self.design,
-                slot_id=res["slot_id"],
-                out_dir=out_dir,
-                sys_clk_freq=self.sys_clk_freq,
-                timing_target_mhz=self.timing_target_mhz,
-                top=self.top,
-            )
+            built = self._local_build(out_dir, image, slot_id)
             try:
                 _client.upload_bitstream(
                     job_id, built.path, built.manifest, self.api_key, self.api_url
@@ -361,10 +435,7 @@ class App:
                     ) from exc
                 raise
         except BaseException:
-            try:
-                _client.cancel_job(job_id, self.api_key, self.api_url)
-            except Exception:
-                pass
+            _cancel_quietly(job_id, self.api_key, self.api_url)
             raise
         self._wait_for_board(job_id)
 
@@ -513,3 +584,55 @@ class App:
         if self._connection is not None:
             self._connection.close()
             self._connection = None
+
+
+#: After a local build, how long to keep asking for a job while the server
+#: says "not now", and how often. The bitstream is already built, so waiting
+#: a while beats throwing it away.
+_RESERVE_RETRY_FOR = 600.0
+_RESERVE_RETRY_EVERY = 15.0
+
+#: Reservation refusals that clear by themselves: the slot pool is full, or
+#: this account's other build (e.g. a second ``mrg run --local`` started
+#: alongside this one -- builds no longer hold anything on the server, so two
+#: can now run at once) has not finished flashing yet.
+_RESERVE_RETRY_CODES = {
+    "no_build_capacity": "no build capacity on the server yet",
+    "build_in_flight": "another build of yours is still in flight",
+}
+
+
+def _reserve_after_build(
+    name: str, api_key: str, api_url: str, bitstream: Path | None = None
+) -> dict:
+    """``reserve_local_build`` for a finished flash-time-identity bitstream,
+    retrying while the server answers ``503 no_build_capacity`` or
+    ``402 build_in_flight``. If it gives up, the error says where the built
+    bitstream is."""
+    deadline = time.monotonic() + _RESERVE_RETRY_FOR
+    while True:
+        try:
+            return _client.reserve_local_build(
+                api_key, api_url, flash_identity=True
+            )
+        except _client.LocalBuildAPIError as exc:
+            reason = _RESERVE_RETRY_CODES.get(exc.code)
+            if reason is None or time.monotonic() >= deadline:
+                if bitstream is None:
+                    raise
+                raise _client.LocalBuildAPIError(
+                    exc.status, exc.code,
+                    f"{exc.message}. The bitstream was built and kept at {bitstream}",
+                ) from exc
+        print(
+            f"[{name}] {reason}; retrying in {_RESERVE_RETRY_EVERY:.0f}s",
+            flush=True,
+        )
+        time.sleep(_RESERVE_RETRY_EVERY)
+
+
+def _cancel_quietly(job_id: str, api_key: str, api_url: str) -> None:
+    try:
+        _client.cancel_job(job_id, api_key, api_url)
+    except Exception:
+        pass

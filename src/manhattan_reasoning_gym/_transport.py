@@ -46,6 +46,14 @@ _CLOSE_SESSION_ENDED = 4410
 # call did not run. Trying again is fine.
 _CLOSE_BOARD_BUSY = 4503
 
+#: Largest write burst sent as one transaction. A bigger ``write`` is split
+#: into consecutive bursts of at most this many words (a 4096-word burst makes
+#: the board host fail with 4502 "Board link failed"; 256 is known to work).
+#: With ``fixed_address`` every chunk targets the same address; otherwise each
+#: chunk starts where the previous one ended. Words reach the bus in order
+#: either way.
+MAX_WRITE_BURST_WORDS = 256
+
 _HTTP_HINT = (
     "If your network blocks WebSockets, use HTTP instead: "
     'App(..., transport="http") or MRG_TRANSPORT=http.'
@@ -80,6 +88,20 @@ def open_transport(
     return WebSocketTransport(target, api_key, api_url)
 
 
+def write_chunks(
+    addr: int, words: list[int], fixed_address: bool
+) -> list[tuple[int, list[int]]]:
+    """Split a write into ``(address, words)`` bursts of at most
+    ``MAX_WRITE_BURST_WORDS``. An empty write stays one (empty) burst."""
+    if len(words) <= MAX_WRITE_BURST_WORDS:
+        return [(addr, list(words))]
+    chunks = []
+    for start in range(0, len(words), MAX_WRITE_BURST_WORDS):
+        chunk_addr = addr if fixed_address else addr + 4 * start
+        chunks.append((chunk_addr, list(words[start:start + MAX_WRITE_BURST_WORDS])))
+    return chunks
+
+
 class HttpTransport:
     """Each call is its own job on the orchestrator's ``/run`` queue."""
 
@@ -94,10 +116,11 @@ class HttpTransport:
     def write(
         self, addr: int, words: list[int], fixed_address: bool = False
     ) -> None:
-        _client.write(
-            self._target, self._api_key, addr, words, self._api_url,
-            fixed_address=fixed_address,
-        )
+        for chunk_addr, chunk in write_chunks(addr, words, fixed_address):
+            _client.write(
+                self._target, self._api_key, chunk_addr, chunk, self._api_url,
+                fixed_address=fixed_address,
+            )
 
     def close(self) -> None:
         """Nothing to close: every call made and finished its own request."""
@@ -134,17 +157,25 @@ class WebSocketTransport:
     def write(
         self, addr: int, words: list[int], fixed_address: bool = False
     ) -> None:
-        """Write ``words`` from ``addr`` up (or all at ``addr`` if fixed)."""
-        what = f"write to {addr:#x}"
-        request = _wire.WishboneRequest(
-            op=_wire.WishboneOp.WRITE,
-            address=addr,
-            data=words,
-            fixed_address=fixed_address,
-        )
-        response = self._transact(request, what)
-        if not response.ok:
-            raise RuntimeError(f"{what} failed")
+        """Write ``words`` from ``addr`` up (or all at ``addr`` if fixed).
+
+        Sent as bursts of at most ``MAX_WRITE_BURST_WORDS``; a failure part
+        way through means the earlier bursts were written.
+        """
+        chunks = write_chunks(addr, words, fixed_address)
+        for i, (chunk_addr, chunk) in enumerate(chunks):
+            what = f"write to {addr:#x}"
+            if len(chunks) > 1:
+                what += f" (burst {i + 1}/{len(chunks)}, {len(chunk)} words)"
+            request = _wire.WishboneRequest(
+                op=_wire.WishboneOp.WRITE,
+                address=chunk_addr,
+                data=chunk,
+                fixed_address=fixed_address,
+            )
+            response = self._transact(request, what)
+            if not response.ok:
+                raise RuntimeError(f"{what} failed")
 
     def close(self) -> None:
         """Close the socket. Safe to call twice."""
